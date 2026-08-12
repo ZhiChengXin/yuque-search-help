@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>孚盟MX 智能检索助手</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Noto+Serif+SC:wght@600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg-stage" aria-hidden="true">
+    <div class="beam beam-a"></div>
+    <div class="beam beam-b"></div>
+    <div class="orb orb-a"></div>
+    <div class="orb orb-b"></div>
+    <div class="grid-fade"></div>
+  </div>
+
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="logo" aria-hidden="true"><span></span></div>
+        <div>
+          <p class="eyebrow">Fumeng MX</p>
+          <h1>智能检索助手</h1>
+        </div>
+      </div>
+
+      <p class="sidebar-label">检索模式</p>
+      <nav class="modes" id="modes">
+        <button class="mode active" data-mode="all" type="button">
+          <span class="mode-kicker">Smart</span>
+          <strong>智能检索</strong>
+          <em>标题 / 章节 / 正文一次搜</em>
+        </button>
+        <button class="mode" data-mode="faq" type="button">
+          <span class="mode-kicker">FAQ</span>
+          <strong>问题排查</strong>
+          <em>故障现象与处理要点</em>
+        </button>
+        <button class="mode" data-mode="manual" type="button">
+          <span class="mode-kicker">Guide</span>
+          <strong>操作手册</strong>
+          <em>步骤说明与功能指引</em>
+        </button>
+        <button class="mode" data-mode="owner" type="button">
+          <span class="mode-kicker">Owner</span>
+          <strong>模块负责人</strong>
+          <em>测试与产品联系方式</em>
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="status-card" id="statusBox">
+          <span class="pulse" id="statusDot"></span>
+          <div>
+            <strong id="statusTitle">连接中</strong>
+            <p id="statusText">正在同步知识库…</p>
+          </div>
+        </div>
+        <button class="ghost-btn" id="syncBtn" type="button">刷新知识库</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section class="search-stage" id="searchStage" data-mode="all">
+        <label for="q" id="searchHint">直接描述问题，例如「特定邮件打开导致网页崩溃」</label>
+        <form id="searchForm" class="search-form">
+          <input id="q" name="q" type="search" autocomplete="off" placeholder="输入标题、报错现象、模块名…" autofocus />
+          <button type="submit" id="searchBtn"><span>立即检索</span></button>
+        </form>
+      </section>
+
+      <section class="advice" id="adviceBox" hidden></section>
+      <section class="meta" id="metaRow" hidden>
+        <span id="resultMeta"></span>
+      </section>
+      <section class="notice" id="noticeBox" hidden></section>
+
+      <section class="contacts" id="contacts" hidden></section>
+      <section class="results" id="results" aria-live="polite"></section>
+
+      <section class="idle-panel" id="emptyState">
+        <div class="intro-note">
+          <p>孚盟MX 智能检索助手汇聚操作手册、问题答疑与模块对接信息。输入问题后，优先返回最相关的原文定位；若暂未匹配到准确内容，将同步提供对应业务线的测试与产品联系人，便于售后、客户与内部同事快速闭环。</p>
+        </div>
+        <div class="suggest-block">
+          <div class="suggest-head">
+            <strong id="suggestTitle">试试这些问题</strong>
+            <span id="suggestSub">点击即可检索</span>
+          </div>
+          <div class="suggest-grid" id="suggestGrid"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

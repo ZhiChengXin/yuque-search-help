@@ -1,0 +1,17 @@
+services:
+  yuque-help-search:
+    build: .
+    image: yuque-help-search:latest
+    container_name: yuque-help-search
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8787
+      - TZ=Asia/Shanghai
+    # 如需挂载日志目录，可取消注释：
+    # volumes:
+    #   - ./logs:/app/logs
