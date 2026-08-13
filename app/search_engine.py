@@ -73,27 +73,44 @@ def tokenize(text: str) -> list[str]:
 
 
 def make_snippet(text: str, query: str, radius: int = 70) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if not text:
-        return ""
-    q = query.strip()
-    idx = text.lower().find(q.lower()) if q else -1
+    preview = make_preview(text, query, max_chars=radius * 2)
+    return preview["text"]
+
+
+def make_preview(text: str, query: str, max_chars: int = 420) -> dict[str, Any]:
+    """生成更长的结果预览；命中点附近优先，超出部分截断。"""
+    source = (text or "").strip()
+    if not source:
+        return {"text": "", "truncated": False}
+
+    compact = re.sub(r"[ \t]+", " ", source)
+    compact = re.sub(r"\n{3,}", "\n\n", compact).strip()
+    if len(compact) <= max_chars:
+        return {"text": compact, "truncated": False}
+
+    q = (query or "").strip()
+    lower = compact.lower()
+    idx = lower.find(q.lower()) if q else -1
     if idx < 0:
         for token in tokenize(query):
-            idx = text.lower().find(token.lower())
+            idx = lower.find(token.lower())
             if idx >= 0:
-                q = token
                 break
+
     if idx < 0:
-        return text[: radius * 2] + ("…" if len(text) > radius * 2 else "")
-    start = max(0, idx - radius)
-    end = min(len(text), idx + len(q) + radius)
-    snippet = text[start:end]
-    if start > 0:
-        snippet = "…" + snippet
-    if end < len(text):
-        snippet = snippet + "…"
-    return snippet
+        cut = compact[:max_chars].rsplit(" ", 1)[0] or compact[:max_chars]
+        return {"text": cut.rstrip("，,。.;；、") + "…", "truncated": True}
+
+    # 以命中位置为中心扩窗，尽量多展示上下文
+    left = max(0, idx - max_chars // 3)
+    right = min(len(compact), left + max_chars)
+    left = max(0, right - max_chars)
+    chunk = compact[left:right]
+    if left > 0:
+        chunk = "…" + chunk.lstrip()
+    if right < len(compact):
+        chunk = chunk.rstrip() + "…"
+    return {"text": chunk, "truncated": True}
 
 
 def normalize_title(text: str) -> str:
@@ -207,6 +224,21 @@ class SearchEngine:
                 coverage = len(hit_tokens) / max(len(q_tokens), 1)
                 bonus += coverage * 4.0
 
+                # 正文充实、带图的章节优先，避免空壳标题霸榜
+                content_len = len(sec.content or "")
+                if content_len >= 120:
+                    bonus += 8.0
+                elif content_len >= 60:
+                    bonus += 4.0
+                if sec.images:
+                    bonus += 5.0 + min(len(sec.images), 3) * 0.8
+                if content_len < 24 and (exact_section or near_section):
+                    bonus -= 18.0
+                # 过宽的目录型标题略降权，优先具体操作章节
+                title = sec.section_title or ""
+                if title in ("功能说明：", "功能说明", "操作步骤", "概述", "简介") or title.endswith("基本设置"):
+                    bonus -= 6.0
+
                 final_score = float(score) + bonus
                 # 精确标题永远保留；弱匹配过滤
                 if exact_section or near_section:
@@ -224,6 +256,8 @@ class SearchEngine:
                         continue
 
                 snippet_source = sec.content or sec.section_title
+                preview = make_preview(snippet_source, query, max_chars=420)
+                images = list(sec.images or [])[:2]
                 results.append(
                     {
                         "id": sec.id,
@@ -231,7 +265,11 @@ class SearchEngine:
                         "doc_title": sec.doc_title,
                         "url": sec.url,
                         "doc_url": sec.doc_url,
-                        "snippet": make_snippet(snippet_source, query),
+                        "snippet": preview["text"],
+                        "preview": preview["text"],
+                        "truncated": bool(preview["truncated"] or len(sec.images or []) > 2),
+                        "images": images,
+                        "image_count": len(sec.images or []),
                         "catalog_path": sec.catalog_path,
                         "updated_at": sec.updated_at,
                         "score": round(final_score, 4),

@@ -355,6 +355,26 @@ function renderResults(query, payload) {
       const path = (item.catalog_path || []).join(" / ");
       const openUrl = item.url || item.doc_url;
       const openLabel = item.has_anchor ? "查看该章节" : "打开语雀原文";
+      const previewText = item.preview || item.snippet || "";
+      const images = Array.isArray(item.images) ? item.images.slice(0, 2) : [];
+      const imageHtml = images.length
+        ? `<div class="preview-images">${images
+            .map(
+              (src) => `
+            <button type="button" class="preview-image" data-fullsrc="${escapeHtml(src)}" title="点击放大查看">
+              <img src="${escapeHtml(src)}" alt="" loading="lazy" referrerpolicy="no-referrer" />
+            </button>`
+            )
+            .join("")}</div>`
+        : "";
+      const moreHint =
+        item.truncated || (item.image_count || 0) > images.length
+          ? `<p class="preview-more">内容较多，已折叠展示部分正文${
+              (item.image_count || 0) > images.length
+                ? `与图片（共 ${item.image_count} 张）`
+                : ""
+            }，可打开章节查看完整内容。</p>`
+          : "";
       return `
         <article class="result-card" style="animation-delay:${index * 40}ms">
           <div class="top">
@@ -363,7 +383,9 @@ function renderResults(query, payload) {
           </div>
           <div class="doc-title">所属文档：${escapeHtml(item.doc_title || "")}</div>
           ${path ? `<div class="path">${escapeHtml(path)}</div>` : ""}
-          <p class="snippet">${highlight(item.snippet, query)}</p>
+          <div class="snippet">${highlight(previewText, query)}</div>
+          ${imageHtml}
+          ${moreHint}
           <div class="card-actions">
             <a class="primary" href="${escapeHtml(openUrl)}" target="_blank" rel="noopener">${openLabel}</a>
           </div>
@@ -435,6 +457,114 @@ $("suggestGrid").addEventListener("click", (e) => {
   if (!btn) return;
   showIntroNote(false);
   doSearch(btn.dataset.q);
+});
+
+let lightboxScale = 1;
+let lightboxOffset = { x: 0, y: 0 };
+let lightboxDragging = false;
+let lightboxDragStart = { x: 0, y: 0 };
+
+function applyLightboxTransform() {
+  const img = $("lightboxImg");
+  img.style.transform = `translate(${lightboxOffset.x}px, ${lightboxOffset.y}px) scale(${lightboxScale})`;
+  $("lightboxZoomLabel").textContent = `${Math.round(lightboxScale * 100)}%`;
+}
+
+function setLightboxZoom(next) {
+  lightboxScale = Math.min(4, Math.max(0.5, next));
+  if (lightboxScale <= 1) {
+    lightboxOffset = { x: 0, y: 0 };
+  }
+  applyLightboxTransform();
+}
+
+function openLightbox(src) {
+  if (!src) return;
+  lightboxScale = 1;
+  lightboxOffset = { x: 0, y: 0 };
+  $("lightboxImg").src = src;
+  applyLightboxTransform();
+  $("lightbox").hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
+function closeLightbox() {
+  $("lightbox").hidden = true;
+  $("lightboxImg").removeAttribute("src");
+  lightboxScale = 1;
+  lightboxOffset = { x: 0, y: 0 };
+  document.body.style.overflow = "";
+}
+
+$("results").addEventListener("click", (e) => {
+  const btn = e.target.closest(".preview-image[data-fullsrc]");
+  if (!btn) return;
+  e.preventDefault();
+  openLightbox(btn.dataset.fullsrc);
+});
+
+$("lightboxClose").addEventListener("click", closeLightbox);
+$("lightboxZoomIn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  setLightboxZoom(lightboxScale + 0.25);
+});
+$("lightboxZoomOut").addEventListener("click", (e) => {
+  e.stopPropagation();
+  setLightboxZoom(lightboxScale - 0.25);
+});
+$("lightboxZoomReset").addEventListener("click", (e) => {
+  e.stopPropagation();
+  setLightboxZoom(1);
+});
+
+$("lightbox").addEventListener("click", (e) => {
+  if (e.target.id === "lightbox" || e.target.id === "lightboxClose") {
+    closeLightbox();
+  }
+});
+
+$("lightboxStage").addEventListener(
+  "wheel",
+  (e) => {
+    if ($("lightbox").hidden) return;
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? -0.15 : 0.15;
+    setLightboxZoom(lightboxScale + delta);
+  },
+  { passive: false }
+);
+
+$("lightboxImg").addEventListener("pointerdown", (e) => {
+  if (lightboxScale <= 1) return;
+  lightboxDragging = true;
+  lightboxDragStart = {
+    x: e.clientX - lightboxOffset.x,
+    y: e.clientY - lightboxOffset.y,
+  };
+  $("lightboxImg").classList.add("is-dragging");
+  $("lightboxImg").setPointerCapture(e.pointerId);
+});
+
+$("lightboxImg").addEventListener("pointermove", (e) => {
+  if (!lightboxDragging) return;
+  lightboxOffset = {
+    x: e.clientX - lightboxDragStart.x,
+    y: e.clientY - lightboxDragStart.y,
+  };
+  applyLightboxTransform();
+});
+
+$("lightboxImg").addEventListener("pointerup", () => {
+  lightboxDragging = false;
+  $("lightboxImg").classList.remove("is-dragging");
+});
+
+document.addEventListener("keydown", (e) => {
+  if ($("lightbox").hidden) return;
+  if (e.key === "Escape") closeLightbox();
+  if (e.key === "+" || e.key === "=") setLightboxZoom(lightboxScale + 0.25);
+  if (e.key === "-") setLightboxZoom(lightboxScale - 0.25);
+  if (e.key === "0") setLightboxZoom(1);
 });
 
 $("syncBtn").addEventListener("click", async () => {

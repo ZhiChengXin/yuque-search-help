@@ -45,6 +45,8 @@ class DocSection:
     catalog_path: list[str] = field(default_factory=list)
     updated_at: str = ""
     kind: str = "section"  # section | doc | contact_row
+    images: list[str] = field(default_factory=list)
+    level: int = 0
 
     @property
     def searchable_text(self) -> str:
@@ -63,6 +65,40 @@ HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 TAG_RE = re.compile(r"<[^>]+>")
+IMG_MD_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+IMG_HTML_RE = re.compile(
+    r"<img[^>]+(?:src|data-src)=[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+
+
+def extract_images(raw: str, limit: int = 8) -> list[str]:
+    """从章节原始 HTML/Markdown 抽取图片地址。"""
+    if not raw:
+        return []
+    urls: list[str] = []
+    seen = set()
+    for match in IMG_HTML_RE.finditer(raw):
+        url = (match.group(1) or "").strip()
+        if not url or url.startswith("data:"):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= limit:
+            return urls
+    for match in IMG_MD_RE.finditer(raw):
+        url = (match.group(1) or "").strip()
+        if not url or url.startswith("data:"):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= limit:
+            break
+    return urls
 
 
 def strip_html(text: str) -> str:
@@ -78,15 +114,28 @@ def strip_html(text: str) -> str:
 
 
 def markdown_or_html_to_text(raw: str) -> str:
+    """转成可读正文，尽量保留段落/步骤换行，便于结果预览。"""
     if not raw:
         return ""
     text = re.sub(r"(?is)<script.*?>.*?</script>", " ", raw)
     text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?is)</(p|div|h[1-6]|li|tr|blockquote)>", "\n", text)
+    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?is)<li[^>]*>", "• ", text)
     text = re.sub(r"!\[.*?\]\(.*?\)", " ", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = TAG_RE.sub(" ", text)
+    text = (
+        text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+    )
     text = re.sub(r"[|*_~>#`]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip()).strip()
 
 
 def split_anchor_markdown(
@@ -118,13 +167,15 @@ def split_anchor_markdown(
                 catalog_path=catalog_path,
                 updated_at=updated_at,
                 kind="doc",
+                images=extract_images(raw),
             )
         )
         return sections
 
     # 文首到第一个标题之间的前言
-    preface = markdown_or_html_to_text(raw[: matches[0].start()])
-    if preface:
+    preface_raw = raw[: matches[0].start()]
+    preface = markdown_or_html_to_text(preface_raw)
+    if preface or extract_images(preface_raw):
         sections.append(
             DocSection(
                 id=f"{doc_id}:preface",
@@ -139,17 +190,25 @@ def split_anchor_markdown(
                 catalog_path=catalog_path,
                 updated_at=updated_at,
                 kind="doc",
+                images=extract_images(preface_raw),
             )
         )
 
     for i, match in enumerate(matches):
+        level = int(match.group(1))
         anchor = match.group(2).strip()
         title = strip_html(match.group(3))
         if not title:
             continue
         start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
-        body = markdown_or_html_to_text(raw[start:end])
+        # 取到下一个同级/更高级标题为止，把下级说明、步骤、图片一并纳入本章预览
+        end = len(raw)
+        for j in range(i + 1, len(matches)):
+            if int(matches[j].group(1)) <= level:
+                end = matches[j].start()
+                break
+        chunk = raw[start:end]
+        body = markdown_or_html_to_text(chunk)
         deep_url = f"{doc_url}#{anchor}" if anchor else doc_url
         sections.append(
             DocSection(
@@ -165,6 +224,8 @@ def split_anchor_markdown(
                 catalog_path=catalog_path,
                 updated_at=updated_at,
                 kind="section",
+                images=extract_images(chunk),
+                level=level,
             )
         )
     return sections

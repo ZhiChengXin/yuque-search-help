@@ -152,6 +152,7 @@ body {
   flex-direction: column;
   gap: 16px;
   padding-top: 0;
+  overflow-x: hidden;
 }
 
 .logo {
@@ -449,6 +450,8 @@ body {
   display: grid;
   gap: 16px;
   margin-bottom: 0;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .contact-card, .result-card {
@@ -457,6 +460,8 @@ body {
   background: var(--panel);
   padding: 20px;
   animation: rise .3s ease both;
+  overflow: hidden;
+  min-width: 0;
 }
 @keyframes rise {
   from { opacity: 0; transform: translateY(8px); }
@@ -526,7 +531,11 @@ body {
   margin: 10px 0 0;
   color: #c5d8e2;
   font-size: 14px;
-  line-height: 1.65;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 9.2em;
+  overflow: hidden;
 }
 .snippet mark,
 .result-card h3 mark,
@@ -540,6 +549,174 @@ body {
   box-decoration-break: clone;
   -webkit-box-decoration-break: clone;
 }
+
+.preview-images {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.preview-image {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #08131c;
+  padding: 0;
+  cursor: zoom-in;
+  position: relative;
+}
+
+.preview-image::after {
+  content: "点击放大";
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  font-size: 11px;
+  color: #04131a;
+  background: rgba(74, 239, 224, 0.92);
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.preview-image img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: 120px;
+  object-fit: cover;
+  object-position: top left;
+}
+
+.preview-more {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 56px 20px 24px;
+  background: rgba(2, 8, 14, 0.86);
+  backdrop-filter: blur(6px);
+}
+
+.lightbox[hidden] {
+  display: none !important;
+}
+
+.lightbox-stage {
+  flex: 1;
+  width: min(960px, 92vw);
+  max-height: calc(86vh - 48px);
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  min-height: 0;
+  border-radius: 12px;
+}
+
+.lightbox-stage img {
+  max-width: min(960px, 92vw);
+  max-height: calc(86vh - 48px);
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 12px;
+  border: 1px solid rgba(120, 180, 200, 0.25);
+  background: #0a1520;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+  transform-origin: center center;
+  transition: transform .12s ease;
+  user-select: none;
+  cursor: grab;
+}
+
+.lightbox-stage img.is-dragging {
+  cursor: grabbing;
+  transition: none;
+}
+
+.lightbox-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(12, 24, 34, 0.96);
+}
+
+.lightbox-tools button {
+  min-width: 36px;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: #0a1520;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 700;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.lightbox-tools button:hover {
+  border-color: rgba(34, 211, 197, 0.5);
+  color: var(--teal);
+}
+
+#lightboxZoomReset {
+  min-width: auto;
+  padding: 0 12px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+#lightboxZoomLabel {
+  min-width: 52px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.lightbox-close {
+  position: absolute;
+  top: 18px;
+  right: 22px;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: #0c1822;
+  color: var(--text);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.lightbox-close:hover {
+  border-color: rgba(34, 211, 197, 0.5);
+  color: var(--teal);
+}
+
 .card-actions {
   display: flex;
   flex-wrap: wrap;
@@ -700,4 +877,5 @@ body {
 
 @media (max-width: 640px) {
   .modes, .suggest-grid { grid-template-columns: 1fr; }
+  .preview-images { grid-template-columns: 1fr; }
 }

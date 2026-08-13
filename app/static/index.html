@@ -97,6 +97,19 @@
     </main>
   </div>
 
+  <div class="lightbox" id="lightbox" hidden>
+    <button type="button" class="lightbox-close" id="lightboxClose" aria-label="关闭">×</button>
+    <div class="lightbox-stage" id="lightboxStage">
+      <img id="lightboxImg" alt="预览大图" referrerpolicy="no-referrer" draggable="false" />
+    </div>
+    <div class="lightbox-tools">
+      <button type="button" id="lightboxZoomOut" aria-label="缩小">−</button>
+      <span id="lightboxZoomLabel">100%</span>
+      <button type="button" id="lightboxZoomIn" aria-label="放大">+</button>
+      <button type="button" id="lightboxZoomReset" aria-label="重置">重置</button>
+    </div>
+  </div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>
