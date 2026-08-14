@@ -74,39 +74,38 @@ function extractKeywords(query) {
   const stop = new Set([
     "为什么", "怎么", "如何", "什么", "一个", "一下", "没有", "可以",
     "或者", "以及", "如果", "还有", "这个", "那个", "进行", "相关",
+    "设置", "使用", "进行", "查看", "打开", "点击",
   ]);
   const parts = [];
 
-  // 整句（去掉问答前缀后）优先，便于标题整句点亮
+  // 整句优先
   if (q.length >= 2) parts.push(q);
 
-  // 按标点切开
+  // 仅按标点切开，避免把整词拆得过碎
   q.split(/[\s，。？！、；：,.!?;:（）()【】\[\]《》"'“”/\\|+]+/)
     .map((p) => p.trim())
-    .filter((p) => p.length >= 2)
+    .filter((p) => p.length >= 3)
     .forEach((p) => parts.push(p));
 
-  // 再抽连续中文片段
-  const cnChunks = q.match(/[\u4e00-\u9fffA-Za-z0-9]{2,}/g) || [];
-  cnChunks.forEach((p) => parts.push(p));
-
-  // 业务高频词额外补强
-  ["孚盟邮", "孚盟邮件", "邮箱", "绑定", "同步", "授权码", "千里眼"].forEach((w) => {
-    if (q.includes(w)) parts.push(w);
+  // 仅补强较长业务词，避免「邮箱」这类短词刷屏
+  ["孚盟邮", "孚盟邮件", "授权码", "千里眼", "WhatsApp"].forEach((w) => {
+    if (q.includes(w) && w.length >= 3) parts.push(w);
   });
 
   const seen = new Set();
-  const result = [];
+  const uniq = [];
   parts
     .filter((p) => p && !stop.has(p))
     .sort((a, b) => b.length - a.length)
     .forEach((p) => {
       const key = p.toLowerCase();
       if (seen.has(key)) return;
+      // 已被更长词覆盖的短词不再单独高亮
+      if (uniq.some((u) => u.toLowerCase().includes(key))) return;
       seen.add(key);
-      result.push(p);
+      uniq.push(p);
     });
-  return result.slice(0, 12);
+  return uniq.slice(0, 4);
 }
 
 function highlight(text, query) {
@@ -361,7 +360,7 @@ function renderResults(query, payload) {
         ? `<div class="preview-images">${images
             .map(
               (src) => `
-            <button type="button" class="preview-image" data-fullsrc="${escapeHtml(src)}" title="点击放大查看">
+            <button type="button" class="preview-image" data-fullsrc="${escapeHtml(src)}" title="查看大图">
               <img src="${escapeHtml(src)}" alt="" loading="lazy" referrerpolicy="no-referrer" />
             </button>`
             )

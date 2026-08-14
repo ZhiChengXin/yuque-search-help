@@ -459,13 +459,19 @@ body {
   border-radius: 18px;
   background: var(--panel);
   padding: 20px;
-  animation: rise .3s ease both;
-  overflow: hidden;
+  animation: rise .28s ease both;
+  overflow-x: hidden;
+  overflow-y: visible;
   min-width: 0;
 }
+.result-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
 @keyframes rise {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .contact-card {
@@ -525,17 +531,18 @@ body {
 .path, .doc-title {
   color: var(--muted);
   font-size: 12px;
-  margin-top: 7px;
+  margin-top: 0;
 }
 .snippet {
-  margin: 10px 0 0;
+  margin: 0;
+  padding: 0;
   color: #c5d8e2;
   font-size: 14px;
-  line-height: 1.7;
+  line-height: 1.75;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 9.2em;
-  overflow: hidden;
+  overflow: visible;
+  max-height: none;
 }
 .snippet mark,
 .result-card h3 mark,
@@ -554,10 +561,15 @@ body {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
-  margin-top: 12px;
+  margin: 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
   width: 100%;
   max-width: 100%;
   min-width: 0;
+  position: relative;
+  z-index: 0;
+  flex: none;
 }
 
 .preview-image {
@@ -570,38 +582,44 @@ body {
   overflow: hidden;
   background: #08131c;
   padding: 0;
+  margin: 0;
   cursor: zoom-in;
   position: relative;
+  appearance: none;
+  -webkit-appearance: none;
+  font: inherit;
+  line-height: 0;
+  color: inherit;
 }
 
 .preview-image::after {
-  content: "点击放大";
-  position: absolute;
-  right: 8px;
-  bottom: 8px;
-  font-size: 11px;
-  color: #04131a;
-  background: rgba(74, 239, 224, 0.92);
-  border-radius: 999px;
-  padding: 3px 8px;
-  font-weight: 700;
-  pointer-events: none;
+  display: none;
 }
 
 .preview-image img {
   display: block;
   width: 100%;
   max-width: 100%;
-  height: 120px;
+  height: 112px;
   object-fit: cover;
   object-position: top left;
+  position: relative;
+  z-index: 0;
 }
 
 .preview-more {
-  margin: 10px 0 0;
+  margin: 0;
   color: var(--muted);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding-top: 2px;
 }
 
 .lightbox {

@@ -231,6 +231,18 @@ def split_anchor_markdown(
     return sections
 
 
+def _cell_text(cell: Any) -> str:
+    """兼容语雀表格单元格新旧字段：value / v。"""
+    if cell is None:
+        return ""
+    if isinstance(cell, dict):
+        for key in ("value", "v", "text", "name"):
+            if key in cell and cell[key] is not None:
+                return str(cell[key]).strip()
+        return ""
+    return str(cell).strip()
+
+
 def parse_lakesheet_contacts(body: str, source_url: str = "") -> list[ContactRecord]:
     """解析语雀 lakesheet 压缩正文，提取业务线/测试/产品联系人。"""
     if not body:
@@ -258,16 +270,24 @@ def parse_lakesheet_contacts(body: str, source_url: str = "") -> list[ContactRec
         # 行号可能是字符串
         row_ids = sorted(int(k) for k in data.keys() if str(k).isdigit())
         for rid in row_ids:
-            if rid == 0:
-                continue
             cols = data.get(str(rid)) or data.get(rid) or {}
+            if not isinstance(cols, dict):
+                continue
             values = []
             for i in range(7):
                 cell = cols.get(str(i)) or cols.get(i) or {}
-                values.append(str(cell.get("value") or "").strip())
+                values.append(_cell_text(cell))
             menu, module, is_standard, testers, business_line, product_owner, product_contact = (
                 values + [""] * 7
             )[:7]
+
+            # 跳过表头
+            header_blob = "".join(values)
+            if rid == 0 or (
+                "一级菜单" in header_blob and "模块" in header_blob and "测试" in header_blob
+            ):
+                continue
+
             if menu:
                 last_menu = menu
             else:

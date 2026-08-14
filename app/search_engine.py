@@ -77,8 +77,8 @@ def make_snippet(text: str, query: str, radius: int = 70) -> str:
     return preview["text"]
 
 
-def make_preview(text: str, query: str, max_chars: int = 420) -> dict[str, Any]:
-    """生成更长的结果预览；命中点附近优先，超出部分截断。"""
+def make_preview(text: str, query: str, max_chars: int = 500) -> dict[str, Any]:
+    """生成结果预览：不超过 max_chars 全量展示；超过则在完整句/行处截断。"""
     source = (text or "").strip()
     if not source:
         return {"text": "", "truncated": False}
@@ -98,19 +98,28 @@ def make_preview(text: str, query: str, max_chars: int = 420) -> dict[str, Any]:
                 break
 
     if idx < 0:
-        cut = compact[:max_chars].rsplit(" ", 1)[0] or compact[:max_chars]
-        return {"text": cut.rstrip("，,。.;；、") + "…", "truncated": True}
+        window = compact[:max_chars]
+        prefix = ""
+    else:
+        left = max(0, idx - max_chars // 5)
+        right = min(len(compact), left + max_chars)
+        left = max(0, right - max_chars)
+        window = compact[left:right]
+        prefix = "…" if left > 0 else ""
 
-    # 以命中位置为中心扩窗，尽量多展示上下文
-    left = max(0, idx - max_chars // 3)
-    right = min(len(compact), left + max_chars)
-    left = max(0, right - max_chars)
-    chunk = compact[left:right]
-    if left > 0:
-        chunk = "…" + chunk.lstrip()
-    if right < len(compact):
-        chunk = chunk.rstrip() + "…"
-    return {"text": chunk, "truncated": True}
+    # 尽量在换行/句号处截断，避免半截句子贴在图片上方
+    break_at = -1
+    for sep in ("\n", "。", "！", "？", "；", ".", ";", " "):
+        pos = window.rfind(sep)
+        if pos >= max(40, len(window) // 3):
+            break_at = max(break_at, pos + (0 if sep == "\n" else 1))
+    if break_at > 0:
+        window = window[:break_at].rstrip("，,、 \t")
+    else:
+        window = window.rstrip("，,、 \t\n")
+
+    suffix = "…"
+    return {"text": f"{prefix}{window}{suffix}", "truncated": True}
 
 
 def normalize_title(text: str) -> str:
@@ -256,7 +265,7 @@ class SearchEngine:
                         continue
 
                 snippet_source = sec.content or sec.section_title
-                preview = make_preview(snippet_source, query, max_chars=420)
+                preview = make_preview(snippet_source, query, max_chars=500)
                 images = list(sec.images or [])[:2]
                 results.append(
                     {
