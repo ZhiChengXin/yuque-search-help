@@ -10,11 +10,25 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    yuque_username: str
-    yuque_password: str
-    yuque_login: str = "fumenggonggongzhanghao"
-    yuque_repo: str = "eggylu"
+    yuque_token: str = ""
+    yuque_username: str = ""
+    yuque_password: str = ""
+    yuque_login: str = "wangyanling-xsdvq"
+    yuque_repo: str = "vf1lt7"
     yuque_host: str = "https://www.yuque.com"
+
+    yuque_feedback_login: str = "wangyanling-xsdvq"
+    yuque_feedback_repo: str = "ezw77w"
+    yuque_feedback_slug: str = "qr67p7rx343mvp9g"
+
+    llm_api_key: str = ""
+    llm_base_url: str = "https://openrouter.ai/api/v1"
+    llm_model: str = "deepseek/deepseek-chat"
+
+    # 本地向量召回（文件缓存在 data/embeddings，原文仍在语雀）
+    embedding_enabled: bool = True
+    embedding_model: str = "qwen/qwen3-embedding-4b"
+    data_dir: str = "data"
 
     host: str = "0.0.0.0"
     port: int = 8787

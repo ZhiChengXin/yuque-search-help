@@ -12,9 +12,9 @@
 | 默认端口 | `8787` |
 | 访问地址 | `http://<服务器IP>:8787` |
 | 运行方式 | Docker Compose（单容器） |
-| 依赖网络 | 容器需能访问外网（拉取语雀知识库） |
+| 依赖网络 | 容器需能访问外网（语雀同步 + OpenRouter 大模型/向量） |
 
-服务启动后会自动登录语雀并同步知识库到内存索引；之后按 `SYNC_INTERVAL_SECONDS`（默认 600 秒）定时刷新。
+服务启动后会用 **语雀 Token** 同步知识库到内存索引，并写入本地向量缓存（`data/embeddings`）；之后按 `SYNC_INTERVAL_SECONDS`（默认 600 秒）定时刷新。
 
 ---
 
@@ -24,7 +24,8 @@
 2. 服务器能访问：
    - Git 仓库
    - Docker 基础镜像源
-   - `https://www.yuque.com`（业务同步依赖）
+   - `https://www.yuque.com`（知识库同步）
+   - `https://openrouter.ai`（大模型重排与向量召回，若启用）
 3. 开放端口 `8787`（或按实际映射端口配置防火墙 / 安全组）
 
 ### 2.1 建议配置国内 Docker 镜像加速
@@ -74,16 +75,31 @@ vi .env   # 或使用其他编辑器
 **必填：**
 
 ```env
-YUQUE_USERNAME=语雀账号（手机号/邮箱）
-YUQUE_PASSWORD=语雀密码
+YUQUE_TOKEN=语雀个人 Token
 ```
+
+> Token 获取：语雀 → 个人设置 → Token。Token 需对目标知识库有**读**权限；若使用「我要反馈」写入功能，还需具备对应反馈文档的写权限。
 
 **常用可选：**
 
 ```env
-YUQUE_LOGIN=fumenggonggongzhanghao
-YUQUE_REPO=eggylu
+YUQUE_LOGIN=wangyanling-xsdvq
+YUQUE_REPO=vf1lt7
 YUQUE_HOST=https://www.yuque.com
+
+# 反馈文档（不进入检索结果）
+YUQUE_FEEDBACK_LOGIN=wangyanling-xsdvq
+YUQUE_FEEDBACK_REPO=ezw77w
+YUQUE_FEEDBACK_SLUG=qr67p7rx343mvp9g
+
+# 大模型 / 向量（OpenRouter）
+LLM_API_KEY=你的 OpenRouter Key
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_MODEL=deepseek/deepseek-chat
+EMBEDDING_ENABLED=true
+EMBEDDING_MODEL=qwen/qwen3-embedding-4b
+DATA_DIR=data
+
 PORT=8787
 SYNC_INTERVAL_SECONDS=600
 APP_TITLE=孚盟MX 智能检索助手
@@ -92,8 +108,9 @@ APP_TITLE=孚盟MX 智能检索助手
 注意：
 
 - `.env` **不要提交到 Git**
-- 语雀账号需对目标知识库有可读权限
-- 账号密码仅保存在服务器本地 / 密钥系统，勿写入镜像
+- **无需**再配置 `YUQUE_USERNAME` / `YUQUE_PASSWORD`（已统一为 Token）
+- Token、LLM Key 仅保存在服务器本地 / 密钥系统，勿写入镜像
+- 建议挂载或持久化 `data/` 目录，避免容器重建后重复全量计算向量
 
 ---
 
@@ -108,11 +125,11 @@ docker compose up -d --build
 # 查看状态
 docker compose ps
 
-# 查看日志（首次启动会同步语雀，可能需要几十秒）
+# 查看日志（首次启动会同步语雀并可能计算向量，可能需要一两分钟）
 docker compose logs -f --tail=200
 ```
 
-首次启动日志中出现类似「同步完成」且 `/api/status` 中 `ready=true` 即表示可用。
+首次启动日志中出现类似「同步完成」且 `/api/status` 中 `ready=true` 即表示可用。若启用向量，状态里还会有 `vector_count`。
 
 ---
 
@@ -122,7 +139,7 @@ docker compose logs -f --tail=200
 # 健康检查
 curl -s http://127.0.0.1:8787/api/health
 
-# 状态（文档数 / 章节数 / 联系人数）
+# 状态（文档数 / 章节数 / 联系人数 / 向量数）
 curl -s http://127.0.0.1:8787/api/status
 
 # 搜索接口冒烟
@@ -219,11 +236,13 @@ server {
 
 | 现象 | 排查 |
 | --- | --- |
-| 页面能开，但一直「同步中 / 未就绪」 | 看日志：账号密码是否正确、服务器能否访问语雀 |
+| 页面能开，但一直「同步中 / 未就绪」 | 看日志：`YUQUE_TOKEN` 是否有效、是否有知识库读权限、服务器能否访问语雀 |
 | 构建很慢 / 拉基础镜像失败 | 配置 Docker `registry-mirrors` 后重试 |
 | pip 安装超时 | 确认 Dockerfile 仍使用清华源；检查出网代理 |
 | 端口冲突 | 修改 `docker-compose.yml` 中 `ports`，如 `"8080:8787"` |
 | 搜索结果为空 | 确认语雀知识库文档已发布；点「刷新知识库」后再试 |
+| 检索一直转圈 / 很慢 | 确认 OpenRouter 可访问；可临时设 `EMBEDDING_ENABLED=false` 对比；查看容器日志是否超时 |
+| 向量数为 0 | 确认已配置 `LLM_API_KEY` 且 `EMBEDDING_ENABLED=true`，再执行一次同步 |
 
 ---
 
@@ -233,10 +252,11 @@ server {
 yuque-help-search/
 ├── Dockerfile              # 镜像构建（含国内 apt/pip 源）
 ├── docker-compose.yml      # 一键部署
-├── .env.example            # 环境变量模板
+├── .env.example            # 环境变量模板（Token，无账号密码）
 ├── .env                    # 真实配置（服务器本地创建，勿提交）
 ├── requirements.txt        # Python 依赖
 ├── DEPLOY.md               # 本手册
+├── data/                   # 本地数据（向量缓存等，建议持久化）
 └── app/                    # 应用代码
 ```
 
@@ -248,7 +268,7 @@ yuque-help-search/
 git clone <仓库地址> yuque-help-search
 cd yuque-help-search
 cp .env.example .env
-# 编辑 .env，填入 YUQUE_USERNAME / YUQUE_PASSWORD
+# 编辑 .env，至少填入 YUQUE_TOKEN；启用大模型/向量时再填 LLM_API_KEY
 docker compose up -d --build
 curl -s http://127.0.0.1:8787/api/status
 ```

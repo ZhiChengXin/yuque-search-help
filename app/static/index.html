@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Noto+Serif+SC:wght@600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260814c" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260819t" />
 </head>
 <body>
   <div class="bg-stage" aria-hidden="true">
@@ -61,6 +61,12 @@
           </div>
         </div>
         <button class="ghost-btn" id="syncBtn" type="button">刷新知识库</button>
+        <button type="button" class="feedback-side-btn" id="feedbackFab">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path fill="currentColor" d="M4 4h12a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9l-4 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm14.5 3.5 3.2-1.3a.8.8 0 0 1 1.1.75v7.1a.8.8 0 0 1-1.1.75L18.5 13.8V7.5z"/>
+          </svg>
+          <span>我要反馈</span>
+        </button>
       </div>
     </aside>
 
@@ -68,7 +74,7 @@
       <section class="search-stage" id="searchStage" data-mode="all">
         <label for="q" id="searchHint">直接描述问题，例如「特定邮件打开导致网页崩溃」</label>
         <form id="searchForm" class="search-form">
-          <input id="q" name="q" type="search" autocomplete="off" placeholder="输入标题、报错现象、模块名…" autofocus />
+          <input id="q" name="q" type="search" autocomplete="off" placeholder="描述问题、报错现象或功能名…" autofocus />
           <button type="submit" id="searchBtn"><span>立即检索</span></button>
         </form>
       </section>
@@ -89,12 +95,25 @@
         <div class="suggest-block">
           <div class="suggest-head">
             <strong id="suggestTitle">试试这些问题</strong>
-            <span id="suggestSub">点击即可检索</span>
+            <span id="suggestSub" hidden></span>
           </div>
           <div class="suggest-grid" id="suggestGrid"></div>
         </div>
       </section>
     </main>
+  </div>
+
+  <div class="feedback-mask" id="feedbackMask" hidden>
+    <form class="feedback-panel" id="feedbackForm">
+      <h2>我要反馈</h2>
+      <textarea id="feedbackText" rows="5" placeholder="请描述问题、具体模块、步骤或期望…"></textarea>
+      <div class="feedback-shots" id="feedbackShots"></div>
+      <p class="feedback-tip" id="feedbackTip">可在输入框内粘贴截图，最多 6 张</p>
+      <div class="feedback-actions">
+        <button type="button" class="ghost-btn" id="feedbackCancel">取消</button>
+        <button type="submit" class="feedback-submit" id="feedbackSubmit">提交反馈</button>
+      </div>
+    </form>
   </div>
 
   <div class="lightbox" id="lightbox" hidden>
@@ -104,12 +123,13 @@
     </div>
     <div class="lightbox-tools">
       <button type="button" id="lightboxZoomOut" aria-label="缩小">−</button>
-      <span id="lightboxZoomLabel">100%</span>
+      <span id="lightboxZoomLabel">适应</span>
       <button type="button" id="lightboxZoomIn" aria-label="放大">+</button>
-      <button type="button" id="lightboxZoomReset" aria-label="重置">重置</button>
+      <button type="button" id="lightboxZoomFit" aria-label="适应窗口">适应</button>
+      <button type="button" id="lightboxZoomReset" aria-label="原图大小">原图</button>
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260814c"></script>
+  <script src="/static/app.js?v=20260819t"></script>
 </body>
 </html>

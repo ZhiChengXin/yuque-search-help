@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import json
+import logging
 import re
 import time
 from typing import Any
@@ -18,6 +20,8 @@ from .models import (
     split_anchor_markdown,
 )
 
+logger = logging.getLogger("yuque-help-search")
+
 YUQUE_PWD_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCfwyOyncSrUTmkaUPsXT6UUdXx
 TQ6a0wgPShvebfwq8XeNj575bUlXxVa/ExIn4nOUwx6iR7vJ2fvz5Ls750D051S7
@@ -34,7 +38,8 @@ MOBILE_UA = (
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 "
+    "YuqueHelpSearch/1.0"
 )
 
 
@@ -49,30 +54,40 @@ def encrypt_password(password: str) -> str:
 class YuqueClient:
     def __init__(
         self,
-        username: str,
-        password: str,
         space_login: str,
         repo: str,
         host: str = "https://www.yuque.com",
+        token: str = "",
+        username: str = "",
+        password: str = "",
     ) -> None:
-        self.username = username
-        self.password = password
         self.space_login = space_login
         self.repo = repo
         self.host = host.rstrip("/")
+        self.token = (token or "").strip()
+        self.username = username
+        self.password = password
         self.namespace = f"{space_login}/{repo}"
         self.book_id: str | None = None
+        headers = {"User-Agent": BROWSER_UA}
+        if self.token:
+            headers["X-Auth-Token"] = self.token
         self._client = httpx.Client(
             timeout=60.0,
             follow_redirects=True,
-            headers={"User-Agent": BROWSER_UA},
+            headers=headers,
         )
-        self._logged_in = False
+        self._logged_in = bool(self.token)
 
     def close(self) -> None:
         self._client.close()
 
     def login(self) -> None:
+        if self.token:
+            self._logged_in = True
+            return
+        if not self.username or not self.password:
+            raise RuntimeError("未配置 YUQUE_TOKEN，也未提供账号密码")
         encrypted = encrypt_password(self.password)
         url = f"{self.host}/api/mobile_app/accounts/login?language=zh-cn"
         resp = self._client.post(
@@ -99,25 +114,40 @@ class YuqueClient:
         if not self._logged_in:
             self.login()
 
-    def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         self.ensure_login()
-        resp = self._client.get(f"{self.host}/{path.lstrip('/')}", params=params)
-        if resp.status_code == 401:
+        url = path if path.startswith("http") else f"{self.host}/{path.lstrip('/')}"
+        resp = self._client.request(method, url, **kwargs)
+        if resp.status_code == 401 and not self.token:
             self._logged_in = False
             self.login()
-            resp = self._client.get(f"{self.host}/{path.lstrip('/')}", params=params)
+            resp = self._client.request(method, url, **kwargs)
+        return resp
+
+    def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        resp = self._request("GET", path, params=params)
         if resp.status_code != 200:
             raise RuntimeError(
-                f"语雀接口失败 {path}: HTTP {resp.status_code} {resp.text[:200]}"
+                f"语雀接口失败 {path}: HTTP {resp.status_code} {resp.text[:240]}"
             )
         payload = resp.json()
         return payload.get("data", payload)
 
     def fetch_book_meta(self) -> dict[str, Any]:
-        import json
+        if self.token:
+            repo = self._get_json(f"api/v2/repos/{self.namespace}")
+            self.book_id = str(repo.get("id") or "")
+            toc = []
+            try:
+                toc_data = self._get_json(f"api/v2/repos/{self.namespace}/toc")
+                toc = toc_data if isinstance(toc_data, list) else (toc_data.get("toc") or [])
+            except Exception:
+                logger.warning("读取知识库 TOC 失败，将不带目录路径")
+            if not self.book_id:
+                raise RuntimeError("未能解析知识库 book_id")
+            return {"book": repo, "toc": toc}
 
-        self.ensure_login()
-        resp = self._client.get(f"{self.host}/{self.namespace}")
+        resp = self._request("GET", f"{self.host}/{self.namespace}")
         if resp.status_code != 200:
             raise RuntimeError(f"无法打开知识库页面: HTTP {resp.status_code}")
         html = resp.text
@@ -138,13 +168,28 @@ class YuqueClient:
         meta = self.fetch_book_meta()
         toc = meta.get("toc") or []
         toc_map = {
-            item.get("url"): item
+            item.get("url") or item.get("slug"): item
             for item in toc
-            if isinstance(item, dict) and item.get("type") == "DOC"
+            if isinstance(item, dict) and str(item.get("type") or "").upper() == "DOC"
         }
-        docs = self._get_json("api/docs", params={"book_id": self.book_id})
-        if not isinstance(docs, list):
-            docs = docs.get("docs") or []
+        if self.token:
+            docs: list[dict[str, Any]] = []
+            offset = 0
+            while True:
+                batch = self._get_json(
+                    f"api/v2/repos/{self.namespace}/docs",
+                    params={"offset": offset, "limit": 100},
+                )
+                if not isinstance(batch, list):
+                    batch = (batch or {}).get("docs") or []
+                docs.extend(batch)
+                if len(batch) < 100:
+                    break
+                offset += 100
+        else:
+            docs = self._get_json("api/docs", params={"book_id": self.book_id})
+            if not isinstance(docs, list):
+                docs = docs.get("docs") or []
 
         enriched = []
         for doc in docs:
@@ -172,8 +217,8 @@ class YuqueClient:
         return list(reversed(titles))
 
     def fetch_anchor_markdown(self, slug: str) -> str:
-        self.ensure_login()
-        resp = self._client.get(
+        resp = self._request(
+            "GET",
             f"{self.host}/{self.namespace}/{slug}/markdown",
             params={"attachment": "true", "latexcode": "false", "anchor": "true"},
         )
@@ -182,6 +227,11 @@ class YuqueClient:
         return ""
 
     def fetch_doc_detail(self, doc_id_or_slug: str) -> dict[str, Any]:
+        if self.token:
+            return self._get_json(
+                f"api/v2/repos/{self.namespace}/docs/{doc_id_or_slug}",
+                params={"raw": "1"},
+            )
         return self._get_json(
             f"api/docs/{doc_id_or_slug}",
             params={"book_id": self.book_id, "raw": "1"},
@@ -198,14 +248,14 @@ class YuqueClient:
             slug = doc.get("slug") or ""
             doc_id = str(doc.get("id") or slug)
             title = (doc.get("title") or "未命名文档").strip()
-            fmt = (doc.get("format") or "").lower()
             catalog_path = doc.get("_catalog_path") or []
             updated_at = str(doc.get("updated_at") or "")
             doc_url = f"{self.host}/{self.namespace}/{slug}"
+            detail = self.fetch_doc_detail(slug or doc_id)
+            fmt = (doc.get("format") or detail.get("format") or "").lower()
 
             if fmt == "lakesheet":
-                detail = self.fetch_doc_detail(doc_id)
-                body = detail.get("body") or detail.get("content") or ""
+                body = detail.get("body") or detail.get("body_sheet") or detail.get("content") or ""
                 parsed = parse_lakesheet_contacts(body, source_url=doc_url)
                 contact_sections = contacts_to_sections(
                     parsed,
@@ -216,9 +266,10 @@ class YuqueClient:
                 )
                 return contact_sections, parsed
 
-            raw = self.fetch_anchor_markdown(slug)
+            raw = ""
+            if not self.token:
+                raw = self.fetch_anchor_markdown(slug)
             if not raw:
-                detail = self.fetch_doc_detail(doc_id)
                 raw = detail.get("body_html") or detail.get("body") or ""
             split = split_anchor_markdown(
                 raw,
@@ -240,3 +291,51 @@ class YuqueClient:
 
         sections.sort(key=lambda x: (x.doc_title, x.section_title))
         return sections, contacts
+
+    def get_doc(self, namespace: str, slug: str) -> dict[str, Any]:
+        return self._get_json(f"api/v2/repos/{namespace}/docs/{slug}", params={"raw": "1"})
+
+    def update_doc_markdown(self, namespace: str, slug: str, title: str, body: str) -> dict[str, Any]:
+        resp = self._request(
+            "PUT",
+            f"api/v2/repos/{namespace}/docs/{slug}",
+            json={"title": title, "body": body, "format": "markdown", "_force_asl": 1},
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"更新语雀文档失败 HTTP {resp.status_code}: {resp.text[:300]}")
+        payload = resp.json()
+        return payload.get("data", payload)
+
+    def upload_image(
+        self,
+        filename: str,
+        content: bytes,
+        mime: str = "image/png",
+        doc_id: str = "",
+    ) -> str:
+        data: dict[str, str] = {"type": "image"}
+        if doc_id:
+            data["attachable_type"] = "Doc"
+            data["attachable_id"] = str(doc_id)
+        resp = self._request(
+            "POST",
+            "api/v2/upload/attach",
+            files={"file": (filename, content, mime)},
+            data=data,
+        )
+        if resp.status_code in (200, 201):
+            payload = resp.json()
+            item = payload.get("data", payload) if isinstance(payload, dict) else {}
+            url = str(
+                item.get("url")
+                or item.get("src")
+                or (item.get("links") or {}).get("url")
+                or ""
+            ).strip()
+            if url:
+                return url
+            raise RuntimeError(f"上传截图未返回地址: {str(payload)[:240]}")
+        if resp.status_code == 401 and "attach_upload" in (resp.text or ""):
+            encoded = base64.b64encode(content).decode("ascii")
+            return f"data:{mime};base64,{encoded}"
+        raise RuntimeError(f"上传截图失败 HTTP {resp.status_code}: {resp.text[:300]}")

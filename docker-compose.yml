@@ -12,6 +12,8 @@ services:
       - HOST=0.0.0.0
       - PORT=8787
       - TZ=Asia/Shanghai
+    volumes:
+      # 持久化本地向量等数据，避免重建容器后全量重算
+      - ./data:/app/data
     # 如需挂载日志目录，可取消注释：
-    # volumes:
     #   - ./logs:/app/logs

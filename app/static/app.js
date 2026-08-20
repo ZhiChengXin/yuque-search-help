@@ -3,8 +3,8 @@ const $ = (id) => document.getElementById(id);
 const MODE_META = {
   all: {
     hint: "直接描述问题，例如「特定邮件打开导致网页崩溃」",
+    placeholder: "描述问题、报错现象或功能名…",
     suggestTitle: "试试这些问题",
-    suggestSub: "根据知识库随机推荐，点击即可查询",
     suggestions: [
       ["特定邮件打开导致网页崩溃", "打开邮件时页面崩溃，怎么排查？"],
       ["邮箱绑定到孚盟邮后，邮件为什么没有完全同步", "绑定后邮件同步不全"],
@@ -15,9 +15,9 @@ const MODE_META = {
     ],
   },
   faq: {
-    hint: "输入故障现象或 FAQ 标题，结果优先问题排查类文档",
+    hint: "输入故障现象或报错原文，优先匹配问题排查类内容",
+    placeholder: "输入故障现象，如「邮件打不开」「同步失败」…",
     suggestTitle: "常见故障",
-    suggestSub: "从问题排查文档中随机推荐",
     suggestions: [
       ["特定邮件打开导致网页崩溃", "特定邮件打开导致网页崩溃"],
       ["邮件内容无法显示", "邮件内容无法显示 / 无法正常查看"],
@@ -28,9 +28,9 @@ const MODE_META = {
     ],
   },
   manual: {
-    hint: "输入操作步骤关键词，例如「绑定邮箱」「签名管理」「定时发送」",
+    hint: "输入操作关键词，例如「绑定邮箱」「签名管理」「定时发送」",
+    placeholder: "输入操作步骤关键词，如「绑定邮箱」「签名管理」…",
     suggestTitle: "操作指引",
-    suggestSub: "从操作手册中随机推荐",
     suggestions: [
       ["绑定邮箱", "如何绑定个人/企业邮箱"],
       ["签名管理", "如何设置和使用邮件签名"],
@@ -42,8 +42,8 @@ const MODE_META = {
   },
   owner: {
     hint: "输入一级/二级菜单名，查找对应测试与产品联系人，例如「孚盟邮」「孚盟邮件」",
+    placeholder: "输入菜单或模块名，如「孚盟邮」「WhatsApp」…",
     suggestTitle: "常用模块",
-    suggestSub: "从分工表中随机推荐",
     suggestions: [
       ["孚盟邮", "查找孚盟邮相关对接人"],
       ["孚盟邮件", "查找孚盟邮件模块负责人"],
@@ -150,16 +150,46 @@ function setNotice(title, text) {
   box.innerHTML = `<strong>${escapeHtml(title)}</strong>${escapeHtml(text || "")}`;
 }
 
+function peopleChips(text) {
+  return String(text || "")
+    .split(/[、，,;；/|]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function paintSuggestions(items) {
   $("suggestGrid").innerHTML = (items || [])
-    .map(
-      (item, index) => `
-      <button type="button" class="suggest-card" data-q="${escapeHtml(item.q)}">
+    .map((item, index) => {
+      const testers = peopleChips(item.testers);
+      const products = peopleChips(item.product_owner);
+      const isOwner = item.kind === "owner" || testers.length || products.length;
+      const peopleHtml =
+        testers.length || products.length
+          ? `<div class="suggest-people">
+              ${
+                testers.length
+                  ? `<div class="people-row"><span>测试</span><div class="name-chips">${testers
+                      .map((n) => `<em>${escapeHtml(n)}</em>`)
+                      .join("")}</div></div>`
+                  : ""
+              }
+              ${
+                products.length
+                  ? `<div class="people-row"><span>产品</span><div class="name-chips">${products
+                      .map((n) => `<em>${escapeHtml(n)}</em>`)
+                      .join("")}</div></div>`
+                  : ""
+              }
+            </div>`
+          : `<em>${escapeHtml(item.desc || "点击即可检索")}</em>`;
+      return `
+      <button type="button" class="suggest-card${isOwner ? " owner-card" : ""}" data-q="${escapeHtml(item.q)}" data-id="${escapeHtml(item.id || "")}">
         <span class="suggest-no">${String(index + 1).padStart(2, "0")}</span>
         <strong>${escapeHtml(item.q)}</strong>
-        <em>${escapeHtml(item.desc || "点击即可检索")}</em>
-      </button>`
-    )
+        ${item.menu ? `<small class="suggest-menu">${escapeHtml(item.menu)}</small>` : ""}
+        ${peopleHtml}
+      </button>`;
+    })
     .join("");
 }
 
@@ -171,7 +201,10 @@ function fallbackSuggestions(mode) {
 function renderSuggestions(mode, items) {
   const meta = MODE_META[mode] || MODE_META.all;
   $("suggestTitle").textContent = meta.suggestTitle || "试试这些问题";
-  $("suggestSub").textContent = meta.suggestSub || "点击即可检索";
+  if ($("suggestSub")) {
+    $("suggestSub").hidden = true;
+    $("suggestSub").textContent = "";
+  }
   paintSuggestions(items && items.length ? items : fallbackSuggestions(mode));
 }
 
@@ -225,8 +258,9 @@ function applyMode(mode, { clearInput = false } = {}) {
     btn.classList.toggle("active", btn.dataset.mode === mode);
   });
   $("searchStage").dataset.mode = mode;
-  const meta = MODE_META[mode];
+  const meta = MODE_META[mode] || MODE_META.all;
   $("searchHint").textContent = meta.hint;
+  $("q").placeholder = meta.placeholder || MODE_META.all.placeholder;
   loadSuggestions(mode);
   if (clearInput) {
     resetSearchPanel();
@@ -253,7 +287,9 @@ async function loadStatus() {
     } else if (data.ready) {
       setStatus(
         "已就绪",
-        `${data.doc_count || 0} 篇文档 · ${data.section_count || 0} 个章节 · ${data.contact_count || 0} 位联系人`,
+        `${data.doc_count || 0} 篇文档 · ${data.section_count || 0} 个章节 · ${data.contact_count || 0} 位联系人${
+          data.vector_enabled ? ` · 向量 ${data.vector_count || 0}` : ""
+        }`,
         "ok"
       );
       const readyKey = `${data.last_synced_at || 0}:${data.section_count || 0}:${data.contact_count || 0}`;
@@ -293,8 +329,26 @@ function renderContacts(contacts, query = "") {
         </div>
         <div class="path">${highlight([c.menu, c.business_line].filter(Boolean).join(" / "), query)}</div>
         <div class="contact-grid">
-          <div><span>测试负责人</span><strong>${escapeHtml(c.testers || "暂未登记")}</strong></div>
-          <div><span>产品负责人</span><strong>${escapeHtml(c.product_owner || "暂未登记")}</strong></div>
+          <div>
+            <span>测试负责人</span>
+            ${
+              peopleChips(c.testers).length
+                ? `<div class="people-row">${peopleChips(c.testers)
+                    .map((n) => `<em>${escapeHtml(n)}</em>`)
+                    .join("")}</div>`
+                : "<strong>暂未登记</strong>"
+            }
+          </div>
+          <div>
+            <span>产品负责人</span>
+            ${
+              peopleChips(c.product_owner).length
+                ? `<div class="people-row">${peopleChips(c.product_owner)
+                    .map((n) => `<em>${escapeHtml(n)}</em>`)
+                    .join("")}</div>`
+                : "<strong>暂未登记</strong>"
+            }
+          </div>
           <div><span>产品联系方式</span><strong>${escapeHtml(c.product_contact || "暂未登记")}</strong></div>
           <div><span>业务线</span><strong>${highlight(c.business_line || "-", query)}</strong></div>
         </div>
@@ -303,25 +357,49 @@ function renderContacts(contacts, query = "") {
     .join("");
 }
 
+function loadingHtml(text = "正在检索…") {
+  const sub =
+    text.includes("匹配") ? "正在查找对应测试与产品对接人" : "稍等片刻，马上就好";
+  return `<div class="loading-state" aria-live="polite">
+    <div class="loading-spinner" aria-hidden="true"></div>
+    <strong>${escapeHtml(text)}</strong>
+    <span>${escapeHtml(sub)}</span>
+  </div>`;
+}
+
 function renderResults(query, payload) {
   const results = filterByMode(payload.results || []);
   const contacts = payload.contacts || [];
   const confidence = payload.confidence || "none";
   const advice = payload.advice || "";
+  const suggestFeedback = Boolean(payload.suggest_feedback);
+  const isOwnerMode = currentMode === "owner";
 
   const adviceBox = $("adviceBox");
-  adviceBox.hidden = !advice;
-  adviceBox.className = `advice ${confidence}`;
-  adviceBox.textContent = advice;
+  const ownerDocHint = Boolean(payload.owner_doc_hint);
+  // 已命中文档时，下方结果卡本身就是答案，不再展示「已定位到…」类提示
+  // 负责人模式：只有问到文档类问题时展示引导文案
+  if ((results.length && !suggestFeedback && !isOwnerMode) || (isOwnerMode && !ownerDocHint)) {
+    adviceBox.hidden = true;
+    adviceBox.textContent = "";
+  } else {
+    adviceBox.hidden = !advice;
+    adviceBox.className = `advice ${confidence}`;
+    adviceBox.textContent = advice;
+  }
 
   $("metaRow").hidden = false;
-  $("resultMeta").textContent = `「${query}」· 文档命中 ${results.length} · 联系人 ${contacts.length}`;
+  if (isOwnerMode) {
+    $("resultMeta").textContent = `「${query}」· 联系人 ${contacts.length}`;
+  } else {
+    $("resultMeta").textContent = `「${query}」· 文档命中 ${results.length}`;
+  }
 
-  if (currentMode === "owner") {
+  if (isOwnerMode) {
     renderContacts(contacts, query);
     $("results").innerHTML = "";
     showIntroNote(false);
-    if (!contacts.length) {
+    if (!contacts.length && !ownerDocHint) {
       setNotice("未匹配到模块负责人", "试试一级/二级菜单名，例如「孚盟邮」「孚盟邮件」「WhatsApp」。");
     } else {
       setNotice("", "");
@@ -329,31 +407,40 @@ function renderResults(query, payload) {
     return;
   }
 
-  if (!results.length || confidence === "none" || confidence === "low") {
-    renderContacts(contacts, query);
-  } else {
-    renderContacts([]);
-  }
-
   if (!results.length) {
-    $("results").innerHTML = "";
+    // 智能检索等模式：只有主动问负责人时才展示联系人卡片
+    renderContacts(contacts, query);
+    $("results").innerHTML = suggestFeedback
+      ? `<div class="miss-card">
+          <h3>暂时没找到对应文档</h3>
+          <p>你可以换个说法再搜，或把问题留下，我们后续补资料。</p>
+          <button type="button" class="feedback-inline-btn" id="missFeedbackBtn">提交这个问题反馈</button>
+        </div>`
+      : "";
     showIntroNote(false);
-    setNotice(
-      contacts.length ? "文档暂未命中，但已找到可联系的人" : "没有找到足够相关的内容",
-      contacts.length
-        ? "建议先联系对应测试/产品，或换个关键词再搜。"
-        : "可以换模块名、报错原文或更短的关键词再试。"
-    );
+    if (contacts.length) {
+      setNotice("已找到可联系的人", "可直接联系对应测试/产品确认。");
+    } else if (suggestFeedback) {
+      setNotice("", "");
+    } else {
+      setNotice("没有找到足够相关的内容", "可以换模块名、报错原文或更短的关键词再试。");
+    }
+    const missBtn = $("missFeedbackBtn");
+    if (missBtn) {
+      missBtn.addEventListener("click", () => openFeedbackWithQuery(query));
+    }
     return;
   }
 
+  renderContacts([]);
   setNotice("", "");
   showIntroNote(false);
   $("results").innerHTML = results
     .map((item, index) => {
       const path = (item.catalog_path || []).join(" / ");
       const openUrl = item.url || item.doc_url;
-      const openLabel = item.has_anchor ? "查看该章节" : "打开语雀原文";
+      const openLabel = "查看该章节";
+      const answerText = String(item.answer || "").trim();
       const previewText = item.preview || item.snippet || "";
       const images = Array.isArray(item.images) ? item.images.slice(0, 2) : [];
       const imageHtml = images.length
@@ -367,22 +454,39 @@ function renderResults(query, payload) {
             .join("")}</div>`
         : "";
       const moreHint =
-        item.truncated || (item.image_count || 0) > images.length
+        !answerText && (item.truncated || (item.image_count || 0) > images.length)
           ? `<p class="preview-more">内容较多，已折叠展示部分正文${
               (item.image_count || 0) > images.length
                 ? `与图片（共 ${item.image_count} 张）`
                 : ""
             }，可打开章节查看完整内容。</p>`
           : "";
+      const matchPercent = Number(item.match_percent);
+      const matchLabel = Number.isFinite(matchPercent)
+        ? `匹配度 ${matchPercent.toFixed(1)}%`
+        : item.match_hint || "相关";
+      const isBest = index === 0;
+      const badgeClass = isBest || matchPercent >= 70 ? "badge match-high" : "badge match-mid";
+      const category = (item.catalog_path || []).slice(-1)[0] || item.doc_title || "";
+      const answerHtml = answerText
+        ? `<div class="answer-hit${isBest ? " is-best" : ""}">
+            <span>解答</span>
+            <p>${highlight(answerText, query)}</p>
+          </div>`
+        : `<div class="snippet-label">原文摘录</div>
+           <div class="snippet">${highlight(previewText, query)}</div>`;
       return `
-        <article class="result-card" style="animation-delay:${index * 40}ms">
+        <article class="result-card${isBest ? " best" : ""}" style="animation-delay:${index * 40}ms">
           <div class="top">
-            <h3><a href="${escapeHtml(openUrl)}" target="_blank" rel="noopener">${highlight(item.title, query)}</a></h3>
-            <span class="badge">${escapeHtml(item.match_hint || "相关")}</span>
+            <div class="title-wrap">
+              ${category ? `<span class="category">${isBest ? "🏆 " : ""}${escapeHtml(category)}</span>` : ""}
+              <h3><a href="${escapeHtml(openUrl)}" target="_blank" rel="noopener">${highlight(item.title, query)}</a></h3>
+            </div>
+            <span class="${badgeClass}">${escapeHtml(matchLabel)}</span>
           </div>
           <div class="doc-title">所属文档：${escapeHtml(item.doc_title || "")}</div>
           ${path ? `<div class="path">${escapeHtml(path)}</div>` : ""}
-          <div class="snippet">${highlight(previewText, query)}</div>
+          ${answerHtml}
           ${imageHtml}
           ${moreHint}
           <div class="card-actions">
@@ -393,20 +497,30 @@ function renderResults(query, payload) {
     .join("");
 }
 
-async function doSearch(query) {
+function openFeedbackWithQuery(_query) {
+  // 未命中时走默认空输入框与 placeholder，不自动填充检索词
+  openFeedback();
+}
+
+async function doSearch(query, { fast = false } = {}) {
   const q = (query || "").trim();
   if (!q) return;
+  const isOwner = currentMode === "owner";
+  const waitText = isOwner ? "正在匹配…" : "正在检索…";
   $("q").value = q;
   $("searchBtn").disabled = true;
-  $("searchBtn").innerHTML = "<span>检索中</span>";
+  $("searchBtn").innerHTML = `<span>${isOwner ? "匹配中" : "检索中"}</span>`;
   showIntroNote(false);
   setNotice("", "");
-  $("results").innerHTML = `<div class="empty"><p>正在检索…</p></div>`;
+  $("results").innerHTML = loadingHtml(waitText);
   $("contacts").hidden = true;
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 45000);
   try {
     const res = await fetch(
-      `/api/search?q=${encodeURIComponent(q)}&limit=12&mode=${encodeURIComponent(currentMode)}`
+      `/api/search?q=${encodeURIComponent(q)}&limit=12&mode=${encodeURIComponent(currentMode)}&fast=${fast ? "1" : "0"}`,
+      { signal: controller.signal }
     );
     const data = await res.json();
     if (!data.ok && !(data.results || []).length && !(data.contacts || []).length) {
@@ -418,16 +532,48 @@ async function doSearch(query) {
       return;
     }
     renderResults(q, data);
-  } catch {
+  } catch (err) {
+    const aborted = err && (err.name === "AbortError" || err.code === 20);
     $("adviceBox").hidden = false;
     $("adviceBox").className = "advice none";
-    $("adviceBox").textContent = "搜索请求失败，请确认服务已启动";
+    $("adviceBox").textContent = aborted
+      ? "检索超时了，请再试一次或换个关键词"
+      : "搜索请求失败，请确认服务已启动";
     $("results").innerHTML = "";
-    setNotice("搜索请求失败", "请确认服务已启动后重试");
+    setNotice(
+      aborted ? "检索超时" : "搜索请求失败",
+      aborted ? "可以缩短问题再搜，或稍后重试。" : "请确认服务已启动后重试"
+    );
   } finally {
+    clearTimeout(timer);
     $("searchBtn").disabled = false;
     $("searchBtn").innerHTML = "<span>立即检索</span>";
   }
+}
+
+async function openSuggestion(q, sectionId) {
+  const query = (q || "").trim();
+  if (!query) return;
+  // 负责人模式：点推荐即匹配联系人，不用「打开文档」文案
+  if (currentMode === "owner" || !sectionId) {
+    await doSearch(query, { fast: true });
+    return;
+  }
+  $("q").value = query;
+  showIntroNote(false);
+  setNotice("", "");
+  $("results").innerHTML = loadingHtml("正在检索…");
+  try {
+    const res = await fetch(`/api/lookup?id=${encodeURIComponent(sectionId)}`);
+    const data = await res.json();
+    if (data.ok && (data.results || []).length) {
+      renderResults(query, data);
+      return;
+    }
+  } catch {
+    // 回退快速检索
+  }
+  await doSearch(query, { fast: true });
 }
 
 $("searchForm").addEventListener("submit", (e) => {
@@ -455,43 +601,97 @@ $("suggestGrid").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-q]");
   if (!btn) return;
   showIntroNote(false);
-  doSearch(btn.dataset.q);
+  openSuggestion(btn.dataset.q, btn.dataset.id || "");
 });
 
-let lightboxScale = 1;
-let lightboxOffset = { x: 0, y: 0 };
+let lightboxUserZoom = 1;
+let lightboxFitScale = 1;
+let lightboxNatural = { w: 0, h: 0 };
 let lightboxDragging = false;
-let lightboxDragStart = { x: 0, y: 0 };
+let lightboxDragStart = { x: 0, y: 0, left: 0, top: 0 };
 
-function applyLightboxTransform() {
-  const img = $("lightboxImg");
-  img.style.transform = `translate(${lightboxOffset.x}px, ${lightboxOffset.y}px) scale(${lightboxScale})`;
-  $("lightboxZoomLabel").textContent = `${Math.round(lightboxScale * 100)}%`;
+function lightboxDisplayScale() {
+  return lightboxFitScale * lightboxUserZoom;
 }
 
-function setLightboxZoom(next) {
-  lightboxScale = Math.min(4, Math.max(0.5, next));
-  if (lightboxScale <= 1) {
-    lightboxOffset = { x: 0, y: 0 };
+function layoutLightboxImage(anchor) {
+  const img = $("lightboxImg");
+  const stage = $("lightboxStage");
+  if (!img || !stage || $("lightbox").hidden) return;
+  const nw = lightboxNatural.w || img.naturalWidth || 0;
+  const nh = lightboxNatural.h || img.naturalHeight || 0;
+  if (!nw || !nh) return;
+
+  const sw = Math.max(stage.clientWidth, 1);
+  const sh = Math.max(stage.clientHeight, 1);
+  // 适应窗口：完整放入可视区域，小图不强制放大超过 1.2
+  lightboxFitScale = Math.min(sw / nw, sh / nh, 1.2);
+  const scale = lightboxDisplayScale();
+  const dw = nw * scale;
+  const dh = nh * scale;
+
+  // 放大时用真实宽高撑开滚动区域，可用滚轮/拖拽浏览，不再困在固定框里
+  const prevLeft = stage.scrollLeft;
+  const prevTop = stage.scrollTop;
+  const prevW = img.offsetWidth || dw;
+  const prevH = img.offsetHeight || dh;
+
+  img.style.width = `${dw}px`;
+  img.style.height = `${dh}px`;
+  img.style.maxWidth = "none";
+  img.style.maxHeight = "none";
+  img.style.transform = "";
+
+  // 居中：内容小于舞台时用 margin
+  const padX = Math.max(0, (sw - dw) / 2);
+  const padY = Math.max(0, (sh - dh) / 2);
+  img.style.marginLeft = `${padX}px`;
+  img.style.marginRight = `${padX}px`;
+  img.style.marginTop = `${padY}px`;
+  img.style.marginBottom = `${padY}px`;
+
+  if (anchor && prevW > 0 && prevH > 0) {
+    const ratioX = (prevLeft + anchor.x) / prevW;
+    const ratioY = (prevTop + anchor.y) / prevH;
+    stage.scrollLeft = Math.max(0, ratioX * dw - anchor.x);
+    stage.scrollTop = Math.max(0, ratioY * dh - anchor.y);
   }
-  applyLightboxTransform();
+
+  const pct = Math.round(lightboxUserZoom * 100);
+  $("lightboxZoomLabel").textContent = lightboxUserZoom === 1 ? "适应" : `${pct}%`;
+}
+
+function setLightboxZoom(next, anchor) {
+  lightboxUserZoom = Math.min(6, Math.max(0.4, next));
+  layoutLightboxImage(anchor);
 }
 
 function openLightbox(src) {
   if (!src) return;
-  lightboxScale = 1;
-  lightboxOffset = { x: 0, y: 0 };
-  $("lightboxImg").src = src;
-  applyLightboxTransform();
+  lightboxUserZoom = 1;
+  lightboxNatural = { w: 0, h: 0 };
+  const img = $("lightboxImg");
+  const stage = $("lightboxStage");
+  img.onload = () => {
+    lightboxNatural = { w: img.naturalWidth, h: img.naturalHeight };
+    layoutLightboxImage();
+    stage.scrollLeft = 0;
+    stage.scrollTop = 0;
+  };
+  img.src = src;
   $("lightbox").hidden = false;
   document.body.style.overflow = "hidden";
+  if (img.complete && img.naturalWidth) {
+    lightboxNatural = { w: img.naturalWidth, h: img.naturalHeight };
+    layoutLightboxImage();
+  }
 }
 
 function closeLightbox() {
   $("lightbox").hidden = true;
   $("lightboxImg").removeAttribute("src");
-  lightboxScale = 1;
-  lightboxOffset = { x: 0, y: 0 };
+  lightboxUserZoom = 1;
+  lightboxNatural = { w: 0, h: 0 };
   document.body.style.overflow = "";
 }
 
@@ -505,15 +705,23 @@ $("results").addEventListener("click", (e) => {
 $("lightboxClose").addEventListener("click", closeLightbox);
 $("lightboxZoomIn").addEventListener("click", (e) => {
   e.stopPropagation();
-  setLightboxZoom(lightboxScale + 0.25);
+  setLightboxZoom(lightboxUserZoom + 0.25);
 });
 $("lightboxZoomOut").addEventListener("click", (e) => {
   e.stopPropagation();
-  setLightboxZoom(lightboxScale - 0.25);
+  setLightboxZoom(lightboxUserZoom - 0.25);
+});
+$("lightboxZoomFit").addEventListener("click", (e) => {
+  e.stopPropagation();
+  setLightboxZoom(1);
+  $("lightboxStage").scrollLeft = 0;
+  $("lightboxStage").scrollTop = 0;
 });
 $("lightboxZoomReset").addEventListener("click", (e) => {
   e.stopPropagation();
-  setLightboxZoom(1);
+  // 原图：相对适应比例放大到 1:1 像素
+  if (!lightboxFitScale) return;
+  setLightboxZoom(1 / lightboxFitScale);
 });
 
 $("lightbox").addEventListener("click", (e) => {
@@ -526,19 +734,38 @@ $("lightboxStage").addEventListener(
   "wheel",
   (e) => {
     if ($("lightbox").hidden) return;
-    e.preventDefault();
-    const delta = e.deltaY > 0 ? -0.15 : 0.15;
-    setLightboxZoom(lightboxScale + delta);
+    // Ctrl/⌘ + 滚轮：缩放；普通滚轮：滚动查看放大后的区域
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      const rect = $("lightboxStage").getBoundingClientRect();
+      const anchor = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      const delta = e.deltaY > 0 ? -0.15 : 0.15;
+      setLightboxZoom(lightboxUserZoom + delta, anchor);
+    }
   },
   { passive: false }
 );
 
+$("lightboxImg").addEventListener("dblclick", (e) => {
+  e.preventDefault();
+  if (lightboxUserZoom === 1) {
+    setLightboxZoom(Math.min(3, 1 / Math.max(lightboxFitScale, 0.2)));
+  } else {
+    setLightboxZoom(1);
+    $("lightboxStage").scrollLeft = 0;
+    $("lightboxStage").scrollTop = 0;
+  }
+});
+
 $("lightboxImg").addEventListener("pointerdown", (e) => {
-  if (lightboxScale <= 1) return;
+  if (lightboxUserZoom <= 1.01) return;
   lightboxDragging = true;
+  const stage = $("lightboxStage");
   lightboxDragStart = {
-    x: e.clientX - lightboxOffset.x,
-    y: e.clientY - lightboxOffset.y,
+    x: e.clientX,
+    y: e.clientY,
+    left: stage.scrollLeft,
+    top: stage.scrollTop,
   };
   $("lightboxImg").classList.add("is-dragging");
   $("lightboxImg").setPointerCapture(e.pointerId);
@@ -546,11 +773,9 @@ $("lightboxImg").addEventListener("pointerdown", (e) => {
 
 $("lightboxImg").addEventListener("pointermove", (e) => {
   if (!lightboxDragging) return;
-  lightboxOffset = {
-    x: e.clientX - lightboxDragStart.x,
-    y: e.clientY - lightboxDragStart.y,
-  };
-  applyLightboxTransform();
+  const stage = $("lightboxStage");
+  stage.scrollLeft = lightboxDragStart.left - (e.clientX - lightboxDragStart.x);
+  stage.scrollTop = lightboxDragStart.top - (e.clientY - lightboxDragStart.y);
 });
 
 $("lightboxImg").addEventListener("pointerup", () => {
@@ -558,12 +783,21 @@ $("lightboxImg").addEventListener("pointerup", () => {
   $("lightboxImg").classList.remove("is-dragging");
 });
 
+window.addEventListener("resize", () => {
+  if ($("lightbox").hidden) return;
+  layoutLightboxImage();
+});
+
 document.addEventListener("keydown", (e) => {
   if ($("lightbox").hidden) return;
   if (e.key === "Escape") closeLightbox();
-  if (e.key === "+" || e.key === "=") setLightboxZoom(lightboxScale + 0.25);
-  if (e.key === "-") setLightboxZoom(lightboxScale - 0.25);
-  if (e.key === "0") setLightboxZoom(1);
+  if (e.key === "+" || e.key === "=") setLightboxZoom(lightboxUserZoom + 0.25);
+  if (e.key === "-") setLightboxZoom(lightboxUserZoom - 0.25);
+  if (e.key === "0") {
+    setLightboxZoom(1);
+    $("lightboxStage").scrollLeft = 0;
+    $("lightboxStage").scrollTop = 0;
+  }
 });
 
 $("syncBtn").addEventListener("click", async () => {
@@ -574,6 +808,115 @@ $("syncBtn").addEventListener("click", async () => {
   } finally {
     await loadStatus();
     $("syncBtn").disabled = false;
+  }
+});
+
+const feedbackImages = [];
+
+function renderFeedbackShots() {
+  $("feedbackShots").innerHTML = feedbackImages
+    .map(
+      (src, i) => `
+      <div class="shot">
+        <img src="${src}" alt="截图${i + 1}" />
+        <button type="button" data-i="${i}" aria-label="删除">×</button>
+      </div>`
+    )
+    .join("");
+}
+
+function openFeedback() {
+  $("feedbackMask").hidden = false;
+  if ($("feedbackTip")) {
+    $("feedbackTip").textContent = "可在输入框内粘贴截图，最多 6 张";
+  }
+  $("feedbackText").focus();
+}
+
+function closeFeedback() {
+  $("feedbackMask").hidden = true;
+}
+
+function addFeedbackImage(dataUrl) {
+  if (!dataUrl || !String(dataUrl).startsWith("data:image/")) return false;
+  if (feedbackImages.length >= 6) {
+    $("feedbackTip").textContent = "最多粘贴 6 张截图";
+    return false;
+  }
+  feedbackImages.push(String(dataUrl));
+  renderFeedbackShots();
+  $("feedbackTip").textContent = `已添加截图（${feedbackImages.length}/6）`;
+  return true;
+}
+
+function collectPasteImages(clipboardData) {
+  const items = clipboardData && clipboardData.items;
+  if (!items) return 0;
+  let added = 0;
+  for (const item of items) {
+    if (!item.type.startsWith("image/")) continue;
+    if (feedbackImages.length >= 6) break;
+    const file = item.getAsFile();
+    if (!file) continue;
+    const reader = new FileReader();
+    reader.onload = () => addFeedbackImage(String(reader.result || ""));
+    reader.readAsDataURL(file);
+    added += 1;
+  }
+  return added;
+}
+
+$("feedbackFab").addEventListener("click", openFeedback);
+$("feedbackCancel").addEventListener("click", closeFeedback);
+$("feedbackMask").addEventListener("click", (e) => {
+  if (e.target.id === "feedbackMask") closeFeedback();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("feedbackMask").hidden) closeFeedback();
+});
+$("feedbackShots").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-i]");
+  if (!btn) return;
+  feedbackImages.splice(Number(btn.dataset.i), 1);
+  renderFeedbackShots();
+});
+document.addEventListener("paste", (e) => {
+  if ($("feedbackMask").hidden) return;
+  if (collectPasteImages(e.clipboardData)) e.preventDefault();
+});
+$("feedbackForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const description = $("feedbackText").value.trim();
+  if (!description && !feedbackImages.length) {
+    $("feedbackTip").textContent = "请填写描述或粘贴截图";
+    return;
+  }
+  $("feedbackSubmit").disabled = true;
+  $("feedbackSubmit").textContent = "提交中…";
+  try {
+    const res = await fetch("/api/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        description,
+        images: feedbackImages,
+        query: $("q").value.trim(),
+        mode: currentMode,
+      }),
+    });
+    const data = await res.json();
+    $("feedbackTip").textContent = data.message || (data.ok ? "已提交" : "提交失败");
+    if (data.ok) {
+      $("feedbackText").value = "";
+      feedbackImages.length = 0;
+      renderFeedbackShots();
+      setTimeout(closeFeedback, 900);
+    }
+  } catch {
+    $("feedbackTip").textContent = "提交失败，请确认服务已启动";
+  } finally {
+    $("feedbackSubmit").disabled = false;
+    $("feedbackSubmit").textContent = "提交反馈";
   }
 });
 

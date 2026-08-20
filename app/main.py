@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import get_settings
+from .feedback import save_feedback
 from .index_service import KnowledgeIndex
 
 logging.basicConfig(
@@ -26,6 +27,13 @@ STATIC_DIR = BASE_DIR / "static"
 class SearchRequest(BaseModel):
     q: str = Field(..., min_length=1, max_length=200)
     limit: int = Field(10, ge=1, le=30)
+
+
+class FeedbackRequest(BaseModel):
+    description: str = Field("", max_length=4000)
+    images: list[str] = Field(default_factory=list)
+    query: str = Field("", max_length=200)
+    mode: str = Field("", max_length=20)
 
 
 @asynccontextmanager
@@ -85,6 +93,7 @@ async def search(
     q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(10, ge=1, le=30),
     mode: str = Query("all", max_length=20),
+    fast: bool = Query(False),
 ):
     index: KnowledgeIndex = app.state.index
     if not index.status().get("ready"):
@@ -98,7 +107,7 @@ async def search(
             "advice": "知识库同步中",
             "status": index.status(),
         }
-    payload = await asyncio.to_thread(index.search, q, limit, mode)
+    payload = await asyncio.to_thread(index.search, q, limit, mode, fast=fast)
     return {
         "ok": True,
         "query": q,
@@ -106,6 +115,17 @@ async def search(
         "count": len(payload.get("results") or []),
         **payload,
     }
+
+
+@app.get("/api/lookup")
+async def lookup(id: str = Query(..., min_length=1, max_length=200)):
+    index: KnowledgeIndex = app.state.index
+    if not index.status().get("ready"):
+        return {"ok": False, "message": "知识库尚未同步完成", "results": []}
+    payload = await asyncio.to_thread(index.lookup, id)
+    if not payload:
+        return {"ok": False, "message": "未找到该章节", "results": []}
+    return {"ok": True, "count": 1, **payload}
 
 
 @app.get("/api/suggest")
@@ -135,3 +155,17 @@ async def sync_now():
     index: KnowledgeIndex = app.state.index
     result = await index.async_sync()
     return {**result, "status": index.status()}
+
+
+@app.post("/api/feedback")
+async def feedback(body: FeedbackRequest):
+    settings = app.state.settings
+    result = await asyncio.to_thread(
+        save_feedback,
+        settings,
+        description=body.description,
+        images=body.images[:6],
+        query=body.query,
+        mode=body.mode,
+    )
+    return result

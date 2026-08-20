@@ -7,7 +7,9 @@ from typing import Any
 import jieba
 from rank_bm25 import BM25Okapi
 
-from .models import ContactRecord, DocSection
+from .models import ContactRecord, DocSection, make_deep_url
+from .synonyms import expand_terms
+
 
 CUSTOM_WORDS = [
     "孚盟邮",
@@ -70,6 +72,63 @@ def tokenize(text: str) -> list[str]:
             seen.add(t)
             result.append(t)
     return result
+
+
+def soften_query(query: str) -> str:
+    """口语叠字归一：转圈圈→转圈，加载中中→加载中。"""
+    text = (query or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"([\u4e00-\u9fff])\1+", r"\1", text)
+
+
+def query_tokens(query: str) -> list[str]:
+    """原句 + 口语归一 + 同义词扩展后的分词，提升召回。"""
+    seen = set()
+    out: list[str] = []
+    for source in (query, soften_query(query)):
+        for t in tokenize(source):
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+    return expand_terms(out)
+
+
+def _lexical_bridge(query: str, title: str, content: str = "", answer: str = "") -> bool:
+    """向量命中时至少要有一点字面/同义词交集，避免天气类误召回。"""
+    tokens = [
+        t
+        for t in query_tokens(query)
+        if len(t) >= 2
+        and t
+        not in {
+            "怎么",
+            "如何",
+            "什么",
+            "怎样",
+            "为什么",
+            "可以",
+            "进行",
+            "相关",
+            "一个",
+            "一下",
+            "这个",
+            "那个",
+            "今天",
+            "怎么样",
+            "怎样啊",
+        }
+    ]
+    if not tokens:
+        return False
+    blob = soften_query(
+        f"{title or ''} {answer or ''} {(content or '')[:240]}"
+    ).lower()
+    hits = sum(1 for t in tokens if soften_query(t).lower() in blob or t.lower() in blob)
+    strong = [t for t in tokens if len(t) >= 3]
+    if strong and any(soften_query(t).lower() in blob or t.lower() in blob for t in strong):
+        return True
+    return hits / max(len(tokens), 1) >= 0.28
 
 
 def make_snippet(text: str, query: str, radius: int = 70) -> str:
@@ -143,17 +202,79 @@ def titles_exact_match(query: str, title: str) -> bool:
     return False
 
 
+def wants_owner_contacts(query: str) -> bool:
+    """用户是否在主动找测试/产品负责人（不是 CRM 里的「创建联系人」功能）。"""
+    text = (query or "").strip()
+    if not text:
+        return False
+    # CRM 功能：创建/新建联系人 → 不当作找对接人
+    if re.search(
+        r"(创建|新建|新增|添加|编辑|修改|删除|导入|导出).{0,8}联系人|"
+        r"联系人.{0,8}(创建|新建|新增|添加|编辑|怎么|如何|步骤)",
+        text,
+    ):
+        return False
+    # 明确找人对接
+    if re.search(
+        r"(负责人|对接人|联系方式|谁负责|找谁|联系谁|对接谁|测试是谁|产品是谁)",
+        text,
+    ):
+        return True
+    if re.search(r"(测试|产品).{0,6}(是谁|谁啊|找谁)", text):
+        return True
+    # 「联系人是谁」这类才算；单说联系人不够
+    if re.search(r"联系人.{0,4}(是谁|谁啊|找谁|对接)", text):
+        return True
+    return False
+
+
+
+def looks_like_doc_question(query: str) -> bool:
+    """是否更像在问操作/文档，而不是查模块名。"""
+    text = (query or "").strip()
+    if not text:
+        return False
+    if wants_owner_contacts(text):
+        return False
+    # 短词更像菜单/模块名
+    if len(text) <= 6 and not re.search(r"[？?怎么如何]", text):
+        return False
+    return bool(
+        re.search(
+            r"(怎么|如何|怎样|咋|设置|配置|操作|步骤|文档|手册|教程|指南|"
+            r"为什么|为啥|无法|失败|报错|开通|绑定|查看|有没有|吗|呢|？|\?)",
+            text,
+        )
+    )
+
+
+def extract_answer_from_content(content: str) -> str:
+    text = (content or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"A[:：]\s*(.+?)(?=(?:\n\s*Q[:：])|$)", text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", match.group(1)).strip(" ；;，,")[:500]
+
+
 class SearchEngine:
     def __init__(self) -> None:
         self.sections: list[DocSection] = []
         self.contacts: list[ContactRecord] = []
         self._corpus_tokens: list[list[str]] = []
         self._bm25: BM25Okapi | None = None
+        self._by_id: dict[str, DocSection] = {}
+        self.vector_index = None
+
+    def set_vector_index(self, vector_index) -> None:
+        self.vector_index = vector_index
 
     def rebuild(self, sections: list[DocSection], contacts: list[ContactRecord]) -> None:
         # 联系人行单独展示，不混进正文检索主结果（避免噪声）
         self.sections = [s for s in sections if s.kind != "contact_row"]
         self.contacts = contacts
+        self._by_id = {s.id: s for s in self.sections}
         self._corpus_tokens = []
         for sec in self.sections:
             weighted = (
@@ -164,7 +285,16 @@ class SearchEngine:
             self._corpus_tokens.append(tokenize(weighted))
         self._bm25 = BM25Okapi(self._corpus_tokens) if self._corpus_tokens else None
 
-    def search(self, query: str, limit: int = 10, mode: str = "all") -> dict[str, Any]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        mode: str = "all",
+        *,
+        keep_weak: bool = False,
+        retrieve_limit: int | None = None,
+        skip_vector: bool = False,
+    ) -> dict[str, Any]:
         query = (query or "").strip()
         mode = (mode or "all").strip().lower()
         if not query:
@@ -178,28 +308,43 @@ class SearchEngine:
         # 模块负责人模式：只查分工表联系人
         if mode == "owner":
             contacts = self.match_contacts(query, limit=min(limit, 8))
-            confidence = "high" if contacts else "none"
-            advice = (
-                "已匹配到对应模块负责人，可直接联系测试/产品。"
-                if contacts
-                else "未匹配到模块负责人，可换一级/二级菜单名再试，例如「孚盟邮」「孚盟邮件」。"
-            )
+            doc_like = looks_like_doc_question(query)
+            if contacts:
+                confidence = "medium" if doc_like else "high"
+                advice = (
+                    "当前是「模块负责人」模式，这里不查操作文档。"
+                    "没找到对应文档，先给你推荐相关联系人，可以直接问测试/产品。"
+                    if doc_like
+                    else "已匹配到对应模块负责人，可直接联系测试/产品。"
+                )
+            else:
+                confidence = "none"
+                advice = (
+                    "当前模式不查文档，也没匹配到相关联系人。"
+                    "可以换一级/二级菜单名再试，或切到「智能检索」查操作说明。"
+                    if doc_like
+                    else "未匹配到模块负责人，可换一级/二级菜单名再试，例如「孚盟邮」「孚盟邮件」。"
+                )
             return {
                 "results": [],
                 "contacts": [c.as_dict() for c in contacts],
                 "confidence": confidence,
                 "advice": advice,
+                "owner_doc_hint": doc_like,
             }
 
-        q_tokens = tokenize(query)
+        q_tokens = query_tokens(query)
         query_lower = query.lower()
+        soft_query = soften_query(query)
+        soft_lower = soft_query.lower()
         results: list[dict[str, Any]] = []
+        pull = retrieve_limit or (max(limit, 16) if keep_weak else limit)
 
         if self.sections and self._bm25 and q_tokens:
             scores = self._bm25.get_scores(q_tokens)
             ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
             for idx, score in ranked:
-                if len(results) >= limit:
+                if len(results) >= pull:
                     break
                 sec = self.sections[idx]
                 title_l = sec.section_title.lower()
@@ -207,16 +352,21 @@ class SearchEngine:
                 content_l = sec.searchable_text.lower()
 
                 bonus = 0.0
-                exact_section = titles_exact_match(query, sec.section_title)
+                exact_section = titles_exact_match(query, sec.section_title) or (
+                    soft_query != query and titles_exact_match(soft_query, sec.section_title)
+                )
                 near_section = (
                     not exact_section
                     and (
                         query_lower in title_l
+                        or soft_lower in title_l
                         or title_l in query_lower
+                        or title_l in soft_lower
                         or normalize_title(query) in normalize_title(sec.section_title)
+                        or normalize_title(soft_query) in normalize_title(sec.section_title)
                     )
                 )
-                exact_doc = query_lower in doc_title_l
+                exact_doc = query_lower in doc_title_l or soft_lower in doc_title_l
                 if exact_section:
                     bonus += 50.0
                 elif near_section:
@@ -226,7 +376,7 @@ class SearchEngine:
                 elif any(t in title_l for t in q_tokens if len(t) > 1):
                     bonus += 6.0
 
-                if query_lower in content_l:
+                if query_lower in content_l or soft_lower in content_l:
                     bonus += 3.0
 
                 hit_tokens = [t for t in q_tokens if t in content_l]
@@ -265,68 +415,92 @@ class SearchEngine:
                         continue
 
                 snippet_source = sec.content or sec.section_title
-                preview = make_preview(snippet_source, query, max_chars=500)
+                answer = (sec.answer or "").strip() or extract_answer_from_content(sec.content)
+                if answer and sec.kind == "qa":
+                    preview = {"text": f"A：{answer}", "truncated": False}
+                else:
+                    preview = make_preview(snippet_source, query, max_chars=500)
                 images = list(sec.images or [])[:2]
+                match_percent = self._score_to_percent(
+                    final_score, exact=exact_section, near=near_section
+                )
                 results.append(
                     {
                         "id": sec.id,
                         "title": sec.section_title,
                         "doc_title": sec.doc_title,
-                        "url": sec.url,
+                        "url": make_deep_url(sec.doc_url, sec.section_title, sec.section_anchor),
                         "doc_url": sec.doc_url,
                         "snippet": preview["text"],
                         "preview": preview["text"],
+                        "answer": answer,
                         "truncated": bool(preview["truncated"] or len(sec.images or []) > 2),
                         "images": images,
                         "image_count": len(sec.images or []),
                         "catalog_path": sec.catalog_path,
                         "updated_at": sec.updated_at,
                         "score": round(final_score, 4),
-                        "match_hint": self._match_hint(
-                            sec, query_lower, hit_tokens, exact_section or near_section
-                        ),
-                        "has_anchor": bool(sec.section_anchor),
+                        "match_percent": match_percent,
+                        "match_hint": f"匹配度 {match_percent:.1f}%",
+                        "has_anchor": bool(sec.section_anchor) or sec.kind == "qa",
                         "kind": sec.kind,
                         "exact_title": exact_section,
                     }
                 )
 
             results.sort(key=lambda x: x["score"], reverse=True)
-            # 二次门禁：若最高分仍偏低且无标题命中，视为未命中文档
-            if results:
-                top = results[0]
-                top_title = (top.get("title") or "").lower()
-                strong = (
-                    top.get("exact_title")
-                    or query_lower in top_title
-                    or top_title in query_lower
-                    or top.get("score", 0) >= 8
-                    or "章节标题命中" in (top.get("match_hint") or "")
-                )
-                meaningful_q = [t for t in q_tokens if len(t) >= 2]
-                top_blob = f"{top_title} {(top.get('snippet') or '').lower()}"
-                hit_ratio = (
-                    sum(1 for t in meaningful_q if t in top_blob) / max(len(meaningful_q), 1)
-                )
-                rare_miss = any(
-                    len(t) >= 4 and t not in top_blob and not any(
-                        t in (r.get("title") or "").lower()
-                        or t in (r.get("snippet") or "").lower()
-                        for r in results[:3]
+            if not keep_weak:
+                # 二次门禁：若最高分仍偏低且无标题命中，视为未命中文档
+                if results:
+                    top = results[0]
+                    top_title = (top.get("title") or "").lower()
+                    strong = (
+                        top.get("exact_title")
+                        or query_lower in top_title
+                        or top_title in query_lower
+                        or top.get("score", 0) >= 8
                     )
-                    for t in meaningful_q
-                )
-                if rare_miss or (not strong and (top.get("score", 0) < 6 or hit_ratio < 0.5)):
-                    results = []
+                    meaningful_q = [t for t in q_tokens if len(t) >= 2]
+                    top_blob = f"{top_title} {(top.get('snippet') or '').lower()}"
+                    hit_ratio = (
+                        sum(1 for t in meaningful_q if t in top_blob) / max(len(meaningful_q), 1)
+                    )
+                    rare_miss = any(
+                        len(t) >= 4 and t not in top_blob and not any(
+                            t in (r.get("title") or "").lower()
+                            or t in (r.get("snippet") or "").lower()
+                            for r in results[:3]
+                        )
+                        for t in meaningful_q
+                    )
+                    if rare_miss or (not strong and (top.get("score", 0) < 6 or hit_ratio < 0.5)):
+                        results = []
 
-            # 已精确命中标题：只保留准确结果，不再附带一堆相关项
-            if results and results[0].get("exact_title"):
-                results = [r for r in results if r.get("exact_title")][:1]
+            results = results[:pull]
+            self._normalize_match_percent(results)
 
-        # 精确命中时不返回联系人；仅在未命中/低置信度时兜底
+        # 向量默认在锁外由 apply_vector_recall 执行，避免卡住整站
+        if not skip_vector:
+            results = self._merge_vector_hits(
+                query, results, pull=max(pull, 16), keep_weak=keep_weak
+            )
+
+        # 主动问负责人：优先联系人，避免弱文档抢镜
+        if wants_owner_contacts(query):
+            contacts = self.match_contacts(query, limit=5)
+            if contacts:
+                strong_doc = bool(results and results[0].get("exact_title"))
+                if not strong_doc:
+                    return {
+                        "results": [],
+                        "contacts": [c.as_dict() for c in contacts],
+                        "confidence": "high",
+                        "advice": "已帮你找到相关模块的测试/产品负责人，可直接联系。",
+                    }
+
         confidence = self._confidence(results, query_lower)
         contacts: list[ContactRecord] = []
-        if confidence in ("none", "low") or not results:
+        if wants_owner_contacts(query) and (confidence in ("none", "low") or not results):
             contacts = self.match_contacts(query, limit=5)
         advice = self._advice(confidence, results, contacts)
 
@@ -335,6 +509,177 @@ class SearchEngine:
             "contacts": [c.as_dict() for c in contacts],
             "confidence": confidence,
             "advice": advice,
+        }
+
+    def apply_vector_recall(
+        self,
+        query: str,
+        payload: dict[str, Any],
+        *,
+        pull: int = 16,
+        keep_weak: bool = False,
+    ) -> dict[str, Any]:
+        """在锁外合并向量召回，并处理「问负责人」短路。"""
+        results = list(payload.get("results") or [])
+        if results and results[0].get("exact_title"):
+            return payload
+        results = self._merge_vector_hits(
+            query, results, pull=max(pull, 16), keep_weak=keep_weak
+        )
+        if wants_owner_contacts(query):
+            contacts = self.match_contacts(query, limit=5)
+            if contacts and not (results and results[0].get("exact_title")):
+                payload["results"] = []
+                payload["contacts"] = [c.as_dict() for c in contacts]
+                payload["confidence"] = "high"
+                payload["advice"] = "已帮你找到相关模块的测试/产品负责人，可直接联系。"
+                return payload
+        payload["results"] = results
+        query_lower = (query or "").lower()
+        payload["confidence"] = self._confidence(results, query_lower)
+        if not payload.get("contacts"):
+            payload["contacts"] = []
+        if not payload.get("advice"):
+            payload["advice"] = self._advice(
+                payload.get("confidence") or "none", results, []
+            )
+        return payload
+
+    def _merge_vector_hits(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        *,
+        pull: int,
+        keep_weak: bool = False,
+    ) -> list[dict[str, Any]]:
+        vector_index = self.vector_index
+        if vector_index is None or not getattr(vector_index, "enabled", False):
+            return results
+        soft = soften_query(query) or query
+        try:
+            # 用归一后的问法做语义检索，阈值略提高减少噪声
+            hits = vector_index.search(soft, top_k=max(12, pull), min_score=0.36)
+        except Exception:
+            return results
+        if not hits:
+            return results
+
+        by_id = {item.get("id"): item for item in results}
+        query_lower = (query or "").lower()
+        soft_lower = soft.lower()
+        for sid, sim in hits:
+            sec = self._by_id.get(sid)
+            if not sec:
+                continue
+            sim_f = float(sim)
+            existing = by_id.get(sid)
+            if existing:
+                if sim_f >= 0.36:
+                    vec_score = 4.0 + sim_f * 18.0
+                    existing["score"] = round(
+                        max(float(existing.get("score") or 0), vec_score), 4
+                    )
+                    existing["vector_score"] = round(sim_f, 4)
+                    existing["vector_hit"] = True
+                continue
+
+            # 纯向量新进候选：要求更高相似度 + 字面/同义词桥接
+            if sim_f < 0.45:
+                continue
+            if not _lexical_bridge(query, sec.section_title, sec.content, sec.answer):
+                continue
+            # fast 模式更严，避免无关问题刷屏
+            if not keep_weak and sim_f < 0.50:
+                continue
+
+            exact_section = titles_exact_match(query, sec.section_title) or titles_exact_match(
+                soft, sec.section_title
+            )
+            near_section = (
+                not exact_section
+                and (
+                    query_lower in (sec.section_title or "").lower()
+                    or soft_lower in (sec.section_title or "").lower()
+                    or (sec.section_title or "").lower() in query_lower
+                )
+            )
+            vec_score = 4.0 + sim_f * 18.0
+            item = self._section_result(
+                sec,
+                query,
+                score=vec_score,
+                exact=exact_section,
+                near=near_section,
+            )
+            item["vector_score"] = round(sim_f, 4)
+            item["vector_hit"] = True
+            by_id[sid] = item
+
+        merged = list(by_id.values())
+        # 二次清洗：仅有弱向量、无字面桥接的踢掉
+        cleaned: list[dict[str, Any]] = []
+        for item in merged:
+            if item.get("exact_title"):
+                cleaned.append(item)
+                continue
+            if item.get("vector_hit") and not item.get("exact_title"):
+                sec = self._by_id.get(item.get("id") or "")
+                title = (item.get("title") or "")
+                content = (sec.content if sec else "") or ""
+                answer = (item.get("answer") or "")
+                sim_f = float(item.get("vector_score") or 0)
+                # BM25 原有结果：保留；纯向量需桥接
+                was_bm25 = any(r.get("id") == item.get("id") for r in results)
+                if was_bm25:
+                    cleaned.append(item)
+                    continue
+                if sim_f >= 0.45 and _lexical_bridge(query, title, content, answer):
+                    cleaned.append(item)
+                continue
+            cleaned.append(item)
+
+        cleaned.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
+        merged = cleaned[:pull]
+        self._normalize_match_percent(merged)
+        return merged
+
+    def _section_result(
+        self,
+        sec: DocSection,
+        query: str,
+        *,
+        score: float,
+        exact: bool,
+        near: bool,
+    ) -> dict[str, Any]:
+        answer = (sec.answer or "").strip() or extract_answer_from_content(sec.content)
+        if answer and sec.kind == "qa":
+            preview = {"text": f"A：{answer}", "truncated": False}
+        else:
+            preview = make_preview(sec.content or sec.section_title, query, max_chars=500)
+        images = list(sec.images or [])[:2]
+        match_percent = self._score_to_percent(score, exact=exact, near=near)
+        return {
+            "id": sec.id,
+            "title": sec.section_title,
+            "doc_title": sec.doc_title,
+            "url": make_deep_url(sec.doc_url, sec.section_title, sec.section_anchor),
+            "doc_url": sec.doc_url,
+            "snippet": preview["text"],
+            "preview": preview["text"],
+            "answer": answer,
+            "truncated": bool(preview["truncated"] or len(sec.images or []) > 2),
+            "images": images,
+            "image_count": len(sec.images or []),
+            "catalog_path": sec.catalog_path,
+            "updated_at": sec.updated_at,
+            "score": round(score, 4),
+            "match_percent": match_percent,
+            "match_hint": f"匹配度 {match_percent:.1f}%",
+            "has_anchor": bool(sec.section_anchor) or sec.kind == "qa",
+            "kind": sec.kind,
+            "exact_title": exact,
         }
 
     def match_contacts(self, query: str, limit: int = 5) -> list[ContactRecord]:
@@ -413,7 +758,7 @@ class SearchEngine:
         exact_section: bool,
     ) -> str:
         if exact_section or titles_exact_match(query_lower, sec.section_title):
-            return "章节标题命中 · 可直达定位"
+            return "匹配度 100.0%"
         if query_lower and query_lower in sec.doc_title.lower():
             return "文档标题命中"
         if hit_tokens:
@@ -445,16 +790,11 @@ class SearchEngine:
         results: list[dict[str, Any]],
         contacts: list[ContactRecord],
     ) -> str:
-        if confidence == "high":
-            return "已定位到最相关章节，可直接打开语雀原文查看。"
-        if confidence == "medium":
-            if contacts:
-                return "已找到相关文档；若仍不确定，可联系对应测试/产品确认。"
-            return "已找到相关文档，建议打开原文核对细节。"
-        if contacts:
-            return "未找到足够准确的文档答案，建议联系对应业务线测试/产品，或查看相关文档。"
+        # 已有结果卡时不额外提示「已定位…」
         if results:
-            return "匹配度一般，建议换个说法再搜，或打开相关文档浏览。"
+            return ""
+        if contacts:
+            return "已找到可联系的人，可直接联系对应测试/产品确认。"
         return "暂未检索到匹配内容，请换关键词，或从业务线联系人获取帮助。"
 
     def suggest(self, mode: str = "all", limit: int = 6) -> list[dict[str, str]]:
@@ -465,7 +805,7 @@ class SearchEngine:
         if mode == "owner":
             return self._suggest_contacts(limit)
 
-        pool: list[tuple[str, str]] = []
+        pool: list[dict[str, str]] = []
         seen = set()
         for sec in self.sections:
             if not self._section_fits_mode(sec, mode):
@@ -481,16 +821,56 @@ class SearchEngine:
                 continue
             seen.add(key)
             desc = self._suggest_desc(sec, title)
-            pool.append((title, desc))
+            pool.append(
+                {
+                    "q": title,
+                    "desc": desc,
+                    "id": sec.id,
+                    "url": make_deep_url(sec.doc_url, sec.section_title, sec.section_anchor),
+                    "kind": sec.kind,
+                }
+            )
 
         if not pool:
             return []
 
-        picks = random.sample(pool, k=min(limit, len(pool)))
-        return [{"q": q, "desc": desc} for q, desc in picks]
+        return random.sample(pool, k=min(limit, len(pool)))
+
+    def lookup(self, section_id: str) -> dict[str, Any] | None:
+        """按章节 id 直接取一条结果，供推荐点击秒开。"""
+        target = (section_id or "").strip()
+        if not target:
+            return None
+        for sec in self.sections:
+            if sec.id != target:
+                continue
+            answer = (sec.answer or "").strip() or extract_answer_from_content(sec.content)
+            preview_text = f"A：{answer}" if answer and sec.kind == "qa" else (sec.content or "")[:500]
+            return {
+                "id": sec.id,
+                "title": sec.section_title,
+                "doc_title": sec.doc_title,
+                "url": make_deep_url(sec.doc_url, sec.section_title, sec.section_anchor),
+                "doc_url": sec.doc_url,
+                "snippet": preview_text,
+                "preview": preview_text,
+                "answer": answer,
+                "truncated": len(sec.content or "") > 500,
+                "images": list(sec.images or [])[:2],
+                "image_count": len(sec.images or []),
+                "catalog_path": sec.catalog_path,
+                "updated_at": sec.updated_at,
+                "score": 100.0,
+                "match_percent": 100.0,
+                "match_hint": "匹配度 100.0%",
+                "has_anchor": bool(sec.section_anchor) or sec.kind == "qa",
+                "kind": sec.kind,
+                "exact_title": True,
+            }
+        return None
 
     def _suggest_contacts(self, limit: int) -> list[dict[str, str]]:
-        pool: list[tuple[str, str]] = []
+        pool: list[dict[str, str]] = []
         seen = set()
         for c in self.contacts:
             name = (c.module or c.menu or "").strip()
@@ -501,15 +881,55 @@ class SearchEngine:
                 continue
             seen.add(key)
             menu = (c.menu or "").strip()
-            if menu and menu != name:
-                desc = f"查找「{name}」对接人（所属：{menu}）"
+            testers = (c.testers or "").strip()
+            product = (c.product_owner or "").strip()
+            if testers or product:
+                bits = []
+                if testers:
+                    bits.append(f"测试 {testers}")
+                if product:
+                    bits.append(f"产品 {product}")
+                desc = " · ".join(bits)
+            elif menu and menu != name:
+                desc = f"所属：{menu}"
             else:
-                desc = f"查找「{name}」模块测试与产品对接人"
-            pool.append((name, desc))
+                desc = "查找模块测试与产品对接人"
+            pool.append(
+                {
+                    "q": name,
+                    "desc": desc,
+                    "menu": menu,
+                    "testers": testers,
+                    "product_owner": product,
+                    "product_contact": (c.product_contact or "").strip(),
+                    "kind": "owner",
+                }
+            )
         if not pool:
             return []
-        picks = random.sample(pool, k=min(limit, len(pool)))
-        return [{"q": q, "desc": desc} for q, desc in picks]
+        return random.sample(pool, k=min(limit, len(pool)))
+
+    @staticmethod
+    def _score_to_percent(score: float, *, exact: bool, near: bool) -> float:
+        if exact:
+            return 100.0
+        if near:
+            return round(min(96.0, 72.0 + score), 1)
+        mapped = 18.0 + max(0.0, score) * 4.2
+        return round(min(88.0, mapped), 1)
+
+    @staticmethod
+    def _normalize_match_percent(results: list[dict[str, Any]]) -> None:
+        if not results:
+            return
+        percents = [float(r.get("match_percent") or 0) for r in results]
+        top = max(percents) if percents else 0
+        if top >= 99.5:
+            return
+        # 让第一条更直观地成为「最佳匹配」
+        if percents[0] < 92 and percents[0] >= 55:
+            results[0]["match_percent"] = round(min(99.0, percents[0] + 8), 1)
+            results[0]["match_hint"] = f"匹配度 {results[0]['match_percent']:.1f}%"
 
     @staticmethod
     def _section_fits_mode(sec: DocSection, mode: str) -> bool:
