@@ -9,7 +9,15 @@ from typing import Any
 from .config import Settings
 from .embeddings import EmbeddingClient, LocalVectorIndex
 from .llm import LLMReranker
-from .search_engine import SearchEngine, query_tokens, soften_query, wants_owner_contacts
+from .query_rewrite import rewrite_query
+from .search_engine import (
+    SearchEngine,
+    gate_query_tokens,
+    query_tokens,
+    soften_query,
+    wants_owner_contacts,
+)
+from .synonyms import configure_synonyms
 from .yuque_client import YuqueClient
 
 logger = logging.getLogger("yuque-help-search")
@@ -18,6 +26,7 @@ logger = logging.getLogger("yuque-help-search")
 class KnowledgeIndex:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        configure_synonyms(settings.data_dir)
         self.engine = SearchEngine()
         self.llm = LLMReranker(
             api_key=settings.llm_api_key,
@@ -119,10 +128,18 @@ class KnowledgeIndex:
 
     def search(self, query: str, limit: int = 10, mode: str = "all", *, fast: bool = False) -> dict[str, Any]:
         mode_l = (mode or "all").strip().lower()
+        original_query = (query or "").strip()
+        display_limit = min(limit, 5)
+        use_llm = (
+            self.llm.enabled
+            and not fast
+            and mode_l != "owner"
+        )
+
         # 主动问负责人：优先短路到联系人，避免文档噪声
-        if mode_l != "owner" and wants_owner_contacts(query):
+        if mode_l != "owner" and wants_owner_contacts(original_query):
             with self._lock:
-                contacts = self.engine.match_contacts(query, limit=min(limit, 8))
+                contacts = self.engine.match_contacts(original_query, limit=min(limit, 8))
             if contacts:
                 return {
                     "results": [],
@@ -133,89 +150,140 @@ class KnowledgeIndex:
                     "suggest_feedback": False,
                 }
 
-        use_llm = (
-            self.llm.enabled
-            and not fast
-            and mode_l != "owner"
-        )
-        # 关键词召回持锁；向量/大模型网络请求绝不能占锁，否则整站卡住
-        with self._lock:
-            payload = self.engine.search(
-                query,
-                limit=limit,
-                mode=mode,
-                keep_weak=use_llm,
-                retrieve_limit=20 if use_llm else None,
-                skip_vector=True,
-            )
-        # 锁外做向量召回（含 embedding API）
-        payload = self.engine.apply_vector_recall(
-            query,
-            payload,
-            pull=20 if use_llm else max(limit, 12),
-            keep_weak=use_llm,
-        )
-        results = payload.get("results") or []
-        # 标题已精确命中，或关键词已很强时，跳过大模型秒回
-        top_pct = float((results[0].get("match_percent") if results else 0) or 0)
-        strong_enough = bool(results) and (
-            results[0].get("exact_title") or top_pct >= 88
-        )
-        if use_llm and strong_enough and _results_cover_query(query, results):
-            payload["results"] = results[:limit]
-            payload["llm_used"] = False
-            payload["confidence"] = "high"
-            payload["suggest_feedback"] = False
-            payload["contacts"] = []
-            payload["advice"] = ""
-            return payload
-        if not use_llm:
-            # 模块负责人模式：只返回分工表结果，不要走「文档未命中」话术
-            if mode_l == "owner":
-                payload["suggest_feedback"] = False
-                return payload
-            # 已有联系人结果（引擎侧短路）直接返回
-            if payload.get("contacts") and not results:
-                payload["suggest_feedback"] = False
-                return payload
-            if not results or not _results_cover_query(query, results):
-                return self._miss_payload(query, payload)
-            payload["suggest_feedback"] = False
-            payload["contacts"] = []
-            return payload
-        if not results:
-            return self._miss_payload(query, payload)
+        primary_query = rewrite_query(original_query) or original_query
+        expanded: list[str] = []
+        first_queries = [primary_query]
+        if use_llm:
+            expanded = self.llm.expand_queries(original_query, limit=3)
+            for eq in expanded:
+                rq = rewrite_query(eq) or eq
+                if rq not in first_queries:
+                    first_queries.append(rq)
 
-        reranked = self.llm.rerank(query, results, limit=max(limit, 8))
+        payload = self._search_with_queries(
+            original_query,
+            first_queries,
+            limit=display_limit,
+            mode=mode,
+            use_llm=use_llm,
+            retrieve_limit=40 if use_llm else max(limit, 16),
+        )
+        if use_llm and not (payload.get("results") or []) and expanded:
+            retry = self._search_with_queries(
+                original_query,
+                first_queries,
+                limit=display_limit,
+                mode=mode,
+                use_llm=use_llm,
+                retrieve_limit=56,
+                second_pass=True,
+                rerank_min_score=48,
+            )
+            if retry.get("results"):
+                return retry
+        return payload
+
+    def _search_with_queries(
+        self,
+        original_query: str,
+        search_queries: list[str],
+        *,
+        limit: int,
+        mode: str,
+        use_llm: bool,
+        retrieve_limit: int,
+        second_pass: bool = False,
+        rerank_min_score: float = 52,
+    ) -> dict[str, Any]:
+        merged_lists: list[list[dict[str, Any]]] = []
+        base_payload: dict[str, Any] = {}
+        for sq in search_queries:
+            with self._lock:
+                part = self.engine.search(
+                    sq,
+                    limit=limit,
+                    mode=mode,
+                    keep_weak=use_llm,
+                    retrieve_limit=retrieve_limit,
+                    skip_vector=True,
+                )
+            part = self.engine.apply_vector_recall(
+                sq,
+                part,
+                pull=retrieve_limit,
+                keep_weak=use_llm,
+            )
+            merged_lists.append(part.get("results") or [])
+            if not base_payload:
+                base_payload = part
+
+        results = _merge_result_lists(merged_lists, cap=retrieve_limit)
+        base_payload["results"] = results
+
+        # 仅标题精确命中时跳过大模型重排
+        if use_llm and results and results[0].get("exact_title"):
+            if _results_cover_query(original_query, results):
+                base_payload["results"] = _sort_by_match_percent(results)[:limit]
+                base_payload["llm_used"] = False
+                base_payload["confidence"] = "high"
+                base_payload["suggest_feedback"] = False
+                base_payload["contacts"] = []
+                base_payload["advice"] = ""
+                return base_payload
+
+        mode_l = (mode or "all").strip().lower()
+        if not use_llm:
+            if mode_l == "owner":
+                base_payload["suggest_feedback"] = False
+                return base_payload
+            if base_payload.get("contacts") and not results:
+                base_payload["suggest_feedback"] = False
+                return base_payload
+            if not results or not _results_cover_query(original_query, results):
+                return self._miss_payload(original_query, base_payload)
+            base_payload["results"] = _sort_by_match_percent(results)[:limit]
+            base_payload["suggest_feedback"] = False
+            base_payload["contacts"] = []
+            return base_payload
+
+        if not results:
+            return self._miss_payload(original_query, base_payload)
+
+        reranked = self.llm.rerank(original_query, results, limit=max(limit, 8))
         if reranked.get("used"):
-            fused = _fuse_ranks(query, results, reranked.get("results") or [], limit)
-            fused = [item for item in fused if float(item.get("match_percent") or 0) >= 55]
-            if not _results_cover_query(query, fused):
+            fused = _fuse_ranks(original_query, results, reranked.get("results") or [], limit)
+            fused = [item for item in fused if float(item.get("match_percent") or 0) >= rerank_min_score]
+            if not _results_cover_query(original_query, fused):
                 fused = []
-            payload["results"] = fused
-            payload["llm_used"] = True
-            for item in payload["results"]:
+            base_payload["results"] = _sort_by_match_percent(fused)[:limit]
+            base_payload["llm_used"] = True
+            for item in base_payload["results"]:
                 pct = float(item.get("match_percent") or 0)
                 item["match_hint"] = f"匹配度 {pct:.1f}%"
             answer = reranked.get("answer") or ""
-            if payload["results"]:
-                top = payload["results"][0]
+            if base_payload["results"]:
+                top = base_payload["results"][0]
                 top_pct = float(top.get("match_percent") or 0)
-                payload["confidence"] = "high" if top_pct >= 75 else "medium"
-                payload["suggest_feedback"] = False
-                payload["contacts"] = []
-                payload["advice"] = answer if answer and top_pct >= 65 else ""
+                base_payload["confidence"] = "high" if top_pct >= 78 else "medium"
+                base_payload["suggest_feedback"] = False
+                base_payload["contacts"] = []
+                base_payload["advice"] = answer if answer and top_pct >= 70 else ""
+                if second_pass and not base_payload["advice"]:
+                    base_payload["advice"] = "已用相近说法重新匹配，请查看下列结果。"
             else:
-                return self._miss_payload(query, payload)
+                return self._miss_payload(original_query, base_payload)
         else:
-            kept = results[:limit]
-            if not _results_cover_query(query, kept):
-                return self._miss_payload(query, payload)
-            payload["results"] = kept
-            payload["llm_used"] = False
-            payload["suggest_feedback"] = False
-            payload["contacts"] = []
-        return payload
+            kept = _sort_by_match_percent(results)[:limit]
+            if not _results_cover_query(original_query, kept):
+                return self._miss_payload(original_query, base_payload)
+            base_payload["results"] = kept
+            base_payload["llm_used"] = False
+            base_payload["suggest_feedback"] = False
+            base_payload["contacts"] = []
+            for item in base_payload["results"]:
+                pct = float(item.get("match_percent") or 0)
+                item["match_hint"] = f"匹配度 {pct:.1f}%"
+        return base_payload
 
     def _miss_payload(self, query: str, base: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = dict(base or {})
@@ -275,8 +343,38 @@ class KnowledgeIndex:
             }
 
 
+def _merge_result_lists(lists: list[list[dict[str, Any]]], *, cap: int = 40) -> list[dict[str, Any]]:
+    """多路检索结果按 id 合并：保留最高分，多路命中略加权。"""
+    by_id: dict[str, dict[str, Any]] = {}
+    hit_count: dict[str, int] = {}
+    for results in lists:
+        for item in results:
+            rid = str(item.get("id") or "")
+            if not rid:
+                continue
+            hit_count[rid] = hit_count.get(rid, 0) + 1
+            prev = by_id.get(rid)
+            score = float(item.get("score") or 0)
+            if not prev or score > float(prev.get("score") or 0):
+                by_id[rid] = dict(item)
+    merged: list[dict[str, Any]] = []
+    for rid, item in by_id.items():
+        if hit_count.get(rid, 0) > 1:
+            item["score"] = round(float(item.get("score") or 0) * 1.06, 4)
+        merged.append(item)
+    merged.sort(
+        key=lambda x: (
+            float(x.get("rrf_score") or 0),
+            float(x.get("match_percent") or 0),
+            float(x.get("score") or 0),
+        ),
+        reverse=True,
+    )
+    return merged[:cap]
+
+
 def _results_cover_query(query: str, results: list[dict[str, Any]]) -> bool:
-    """关键业务词至少命中一半，避免「采购」却命中「签名管理」这类假匹配。"""
+    """关键业务词至少命中一部分；界面词/同义词扩展不参与，避免口语长句被误杀。"""
     if not results:
         return False
     top = results[0]
@@ -288,35 +386,7 @@ def _results_cover_query(query: str, results: list[dict[str, Any]]) -> bool:
     except (TypeError, ValueError):
         vec_score = 0.0
 
-    soft = soften_query(query)
-    keys = [
-        t
-        for t in query_tokens(query)
-        if len(t) >= 2
-        and t
-        not in {
-            "怎么",
-            "如何",
-            "什么",
-            "配置",
-            "设置",
-            "进行",
-            "页面",
-            "一直",
-            "今天",
-            "怎么样",
-            "怎样",
-        }
-    ]
-    normalized_keys = []
-    seen = set()
-    for t in keys:
-        nt = soften_query(t) or t
-        if nt not in seen:
-            seen.add(nt)
-            normalized_keys.append(nt)
-    core = [t for t in normalized_keys if len(t) >= 3] or normalized_keys
-
+    core = [t for t in gate_query_tokens(query) if len(t) >= 3] or gate_query_tokens(query)
     blob = " ".join(
         [
             str(top.get("title") or ""),
@@ -329,18 +399,36 @@ def _results_cover_query(query: str, results: list[dict[str, Any]]) -> bool:
     ).lower()
     soft_blob = soften_query(blob)
     hits = sum(1 for t in core if t in blob or t in soft_blob) if core else 0
-    lexical_ok = (not core) or (hits >= 1 and hits / max(len(core), 1) >= 0.34)
+    ratio = hits / max(len(core), 1)
+    lexical_ok = (not core) or (hits >= 1 and ratio >= 0.28)
 
     # 向量很高也要有一点字面交集；否则当误召回
     if top.get("vector_hit") and vec_score >= 0.55 and lexical_ok:
         return True
-    if top.get("vector_hit") and vec_score >= 0.45 and lexical_ok and hits / max(len(core), 1) >= 0.45:
+    if top.get("vector_hit") and vec_score >= 0.45 and lexical_ok and ratio >= 0.4:
         return True
     if not core:
         return True
     if len(core) == 1:
         return hits >= 1
-    return hits / len(core) >= 0.40
+    # 长问法更宽松：至少命中 2 个实质词，或比例不太离谱
+    if hits >= 2 and ratio >= 0.28:
+        return True
+    return ratio >= 0.34
+
+
+def _sort_by_match_percent(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """展示顺序与匹配度一致：分数高的在前，供前端「最佳」标记。"""
+    return sorted(
+        results,
+        key=lambda x: (
+            float(x.get("match_percent") or 0),
+            float(x.get("rrf_score") or 0),
+            float(x.get("vector_score") or 0),
+            1 if x.get("llm_ranked") else 0,
+        ),
+        reverse=True,
+    )
 
 
 def _fuse_ranks(
@@ -349,7 +437,7 @@ def _fuse_ranks(
     llm_items: list[dict[str, Any]],
     limit: int,
 ) -> list[dict[str, Any]]:
-    """关键词召回与模型打分融合；模型未选中的弱结果直接丢掉。"""
+    """关键词召回与模型打分融合；以语义（模型）为主，避免字面分虚高。"""
     if not llm_items:
         # 模型明确认为都无关时，不再用弱关键词结果硬撑
         strong = [
@@ -370,20 +458,31 @@ def _fuse_ranks(
         blob = f"{item.get('title') or ''} {item.get('doc_title') or ''}".lower()
         soft_blob = soften_query(blob)
         overlap = sum(1 for t in q_tokens if t in blob or soften_query(t) in soft_blob)
-        strong = (
+        lexical_strong = (
             bool(item.get("exact_title"))
             or overlap >= 2
-            or (item.get("vector_hit") and float(item.get("vector_score") or 0) >= 0.42)
+            or (item.get("vector_hit") and float(item.get("vector_score") or 0) >= 0.48)
         )
         bm25 = float(item.get("match_percent") or 0)
         if llm_item:
             llm_pct = float(llm_item.get("match_percent") or 0)
-            score = llm_pct * 0.72 + bm25 * 0.28
-            if strong:
-                score = max(score, bm25, llm_pct)
-                score = min(100.0, score + 6)
+            # 语义为主：模型分决定上限，关键词只作微调
+            score = llm_pct * 0.88 + bm25 * 0.12
+            if item.get("exact_title"):
+                score = max(score, 96.0)
+            else:
+                # 模型本身不高时，不让关键词把分数抬上去
+                if llm_pct < 60:
+                    score = min(score, llm_pct + 4)
+                # 非精确标题保守封顶
+                score = min(score, 92.0 if lexical_strong else 86.0)
         else:
-            score = bm25
+            # 模型未选中：仅保留精确标题或较强向量，且压低展示分
+            if item.get("exact_title"):
+                score = bm25
+            else:
+                vec = float(item.get("vector_score") or 0)
+                score = min(bm25, 35.0 + vec * 50.0, 78.0)
         cloned = dict(item)
         cloned["match_percent"] = round(min(100.0, max(0.0, score)), 1)
         cloned["llm_ranked"] = bool(llm_item)

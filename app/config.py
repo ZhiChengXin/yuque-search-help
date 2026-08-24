@@ -23,12 +23,16 @@ class Settings(BaseSettings):
 
     llm_api_key: str = ""
     llm_base_url: str = "https://openrouter.ai/api/v1"
-    llm_model: str = "deepseek/deepseek-chat"
+    llm_model: str = "qwen/qwen-2.5-72b-instruct"
 
     # 本地向量召回（文件缓存在 data/embeddings，原文仍在语雀）
     embedding_enabled: bool = True
     embedding_model: str = "qwen/qwen3-embedding-4b"
     data_dir: str = "data"
+
+    # 语雀 Webhook：知识库「消息推送」填 http://你的域名:8787/api/yuque/webhook?token=密钥
+    yuque_webhook_secret: str = ""
+    yuque_webhook_debounce_seconds: float = 12.0
 
     host: str = "0.0.0.0"
     port: int = 8787

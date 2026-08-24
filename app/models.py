@@ -70,6 +70,24 @@ QA_BLOCK_RE = re.compile(
     r"(?:^|\n)\s*Q[:：]\s*(.+?)\s*\n\s*A[:：]\s*(.+?)(?=(?:\n\s*Q[:：])|$)",
     re.IGNORECASE | re.DOTALL,
 )
+# 语雀 FAQ 常见编号：Q1：问题 … Q2：问题（无显式 A：，答案为后续条目）
+NUMBERED_QA_MARKER_RE = re.compile(r"(?:^|\n)\s*(Q\d+)\s*[:：]\s*", re.IGNORECASE)
+NUMBERED_QA_RAW_MARKER_RE = re.compile(
+    r"(?:^|(?<=[\n>]))\s*Q\d+\s*[:：]\s*",
+    re.IGNORECASE,
+)
+# 操作手册常见大纲：一、 / 问题1： / 第1步 / 1、标题
+OUTLINE_LINE_RE = re.compile(
+    r"^(?:"
+    r"(?:[一二三四五六七八九十百]+[、．.\s])"
+    r"|(?:问题\d+[：:])"
+    r"|(?:第\s*[一二三四五六七八九十\d]+\s*(?:步|章|节|部分)[、．.:：\s]*)"
+    r"|(?:\d+[、．.]\s*\S)"
+    r"|(?:\d+\s+[^\d\s].{1,40})$"
+    r")",
+    re.MULTILINE,
+)
+PROBLEM_FAQ_MARKER_RE = re.compile(r"(?:^|\n)\s*(问题\d+)\s*[：:]\s*", re.IGNORECASE)
 TAG_RE = re.compile(r"<[^>]+>")
 IMG_MD_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 IMG_HTML_RE = re.compile(
@@ -167,6 +185,258 @@ def _qa_raw_chunks(raw: str) -> list[str]:
     return chunks
 
 
+def _numbered_qa_raw_chunks(raw: str) -> list[str]:
+    """按 Q1：/Q2： 编号切分原始正文。"""
+    source = raw or ""
+    if not source:
+        return []
+    hits = list(NUMBERED_QA_RAW_MARKER_RE.finditer(source))
+    if not hits:
+        return []
+    chunks: list[str] = []
+    for i, hit in enumerate(hits):
+        start = hit.start()
+        end = hits[i + 1].start() if i + 1 < len(hits) else len(source)
+        chunks.append(source[start:end])
+    return chunks
+
+
+def _parse_numbered_qa_chunk(text: str) -> tuple[str, str, str] | None:
+    """解析 Q1：问题 + 后续条目，返回 (Q1, 问题, 答案正文)。"""
+    source = (text or "").strip()
+    if not source:
+        return None
+    match = re.match(r"^(Q\d+)\s*[:：]\s*(.+)$", source, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    label = match.group(1).upper()
+    rest = match.group(2).strip()
+    lines = rest.split("\n", 1)
+    question = re.sub(r"\s+", " ", lines[0]).strip()
+    answer = lines[1].strip() if len(lines) > 1 else ""
+    if len(question) < 4:
+        return None
+    return label, question, answer
+
+
+def _append_numbered_qa_section(
+    sections: list[DocSection],
+    *,
+    idx: int,
+    label: str,
+    question: str,
+    answer: str,
+    doc_id: str,
+    slug: str,
+    doc_title: str,
+    doc_url: str,
+    catalog_path: list[str],
+    updated_at: str,
+    id_prefix: str,
+    parent_url: str,
+    parent_anchor: str,
+    images: list[str],
+) -> None:
+    section_id = f"{doc_id}:{id_prefix}-{idx + 1}"
+    deep = make_deep_url(parent_url or doc_url, f"{label}：{question}", parent_anchor)
+    answer_one_line = re.sub(r"\s+", " ", answer).strip(" ；;，,")
+    sections.append(
+        DocSection(
+            id=section_id,
+            doc_id=doc_id,
+            slug=slug,
+            doc_title=doc_title,
+            section_title=question,
+            section_anchor=parent_anchor,
+            content=f"{label}：{question}\n{answer}".strip(),
+            url=deep,
+            doc_url=doc_url,
+            catalog_path=catalog_path,
+            updated_at=updated_at,
+            kind="qa",
+            images=images,
+            level=0,
+            answer=answer_one_line[:500] if answer_one_line else "",
+        )
+    )
+
+
+def split_problem_faq_sections(
+    text: str,
+    *,
+    doc_id: str,
+    slug: str,
+    doc_title: str,
+    doc_url: str,
+    catalog_path: list[str],
+    updated_at: str = "",
+    images: list[str] | None = None,
+    id_prefix: str = "pf",
+) -> list[DocSection]:
+    """沟通类 FAQ：问题1：标题 … 问题2："""
+    source = (text or "").strip()
+    if not source:
+        return []
+    hits = list(PROBLEM_FAQ_MARKER_RE.finditer(source))
+    if len(hits) < 2:
+        return []
+    sections: list[DocSection] = []
+    shared_images = list(images or [])
+    for idx, hit in enumerate(hits):
+        label = hit.group(1)
+        block_start = hit.end()
+        block_end = hits[idx + 1].start() if idx + 1 < len(hits) else len(source)
+        block = source[block_start:block_end].strip()
+        lines = block.split("\n", 1)
+        question = re.sub(r"\s+", " ", lines[0]).strip()
+        answer = lines[1].strip() if len(lines) > 1 else ""
+        if len(question) < 4:
+            continue
+        title = f"{label}：{question}"
+        item_images = shared_images if (idx == 0 or len(shared_images) <= 2) else []
+        answer_one_line = re.sub(r"\s+", " ", answer).strip(" ；;，,")
+        sections.append(
+            DocSection(
+                id=f"{doc_id}:{id_prefix}-{idx + 1}",
+                doc_id=doc_id,
+                slug=slug,
+                doc_title=doc_title,
+                section_title=title,
+                section_anchor="",
+                content=f"{title}\n{answer}".strip(),
+                url=make_deep_url(doc_url, title),
+                doc_url=doc_url,
+                catalog_path=catalog_path,
+                updated_at=updated_at,
+                kind="qa",
+                images=item_images,
+                level=0,
+                answer=answer_one_line[:500] if answer_one_line else "",
+            )
+        )
+    return sections
+
+
+def split_outline_sections(
+    text: str,
+    *,
+    doc_id: str,
+    slug: str,
+    doc_title: str,
+    doc_url: str,
+    catalog_path: list[str],
+    updated_at: str = "",
+    images: list[str] | None = None,
+    id_prefix: str = "ol",
+    min_blocks: int = 2,
+    min_body_len: int = 60,
+) -> list[DocSection]:
+    """无 HTML 标题的操作手册：按 一、/1、/第N步 等大纲行切分。"""
+    source = (text or "").strip()
+    if len(source) < min_body_len * 2:
+        return []
+    lines = source.split("\n")
+    markers: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or len(stripped) > 80:
+            continue
+        normalized = re.sub(r"^[lL•\-\*]\s*", "", stripped)
+        if OUTLINE_LINE_RE.match(normalized) or OUTLINE_LINE_RE.match(stripped):
+            markers.append((i, stripped))
+    if len(markers) < min_blocks:
+        return []
+    sections: list[DocSection] = []
+    shared_images = list(images or [])
+    for idx, (line_no, title) in enumerate(markers):
+        next_line = markers[idx + 1][0] if idx + 1 < len(markers) else len(lines)
+        body = "\n".join(lines[line_no:next_line]).strip()
+        if len(body) < min_body_len:
+            continue
+        section_id = f"{doc_id}:{id_prefix}-{idx + 1}"
+        sections.append(
+            DocSection(
+                id=section_id,
+                doc_id=doc_id,
+                slug=slug,
+                doc_title=doc_title,
+                section_title=title[:120],
+                section_anchor="",
+                content=body,
+                url=make_deep_url(doc_url, title),
+                doc_url=doc_url,
+                catalog_path=catalog_path,
+                updated_at=updated_at,
+                kind="section",
+                images=shared_images if (idx == 0 or len(shared_images) <= 2) else [],
+                level=0,
+            )
+        )
+    return sections
+
+
+def _split_plain_document(
+    raw: str,
+    *,
+    doc_id: str,
+    slug: str,
+    doc_title: str,
+    doc_url: str,
+    catalog_path: list[str],
+    updated_at: str = "",
+) -> list[DocSection]:
+    """无 HTML 锚点时的回退：Q/A → 问题1 → 大纲 → 整篇。"""
+    qa_sections = split_qa_from_raw(
+        raw,
+        doc_id=doc_id,
+        slug=slug,
+        doc_title=doc_title,
+        doc_url=doc_url,
+        catalog_path=catalog_path,
+        updated_at=updated_at,
+    )
+    if qa_sections:
+        return qa_sections
+    body = markdown_or_html_to_text(raw)
+    images = extract_images(raw)
+    for splitter, prefix in (
+        (split_problem_faq_sections, "pf"),
+        (split_outline_sections, "ol"),
+    ):
+        parts = splitter(
+            body,
+            doc_id=doc_id,
+            slug=slug,
+            doc_title=doc_title,
+            doc_url=doc_url,
+            catalog_path=catalog_path,
+            updated_at=updated_at,
+            images=images,
+            id_prefix=prefix,
+        )
+        if parts:
+            return parts
+    if not body.strip():
+        return []
+    return [
+        DocSection(
+            id=f"{doc_id}:root",
+            doc_id=doc_id,
+            slug=slug,
+            doc_title=doc_title,
+            section_title=doc_title,
+            section_anchor="",
+            content=body,
+            url=doc_url,
+            doc_url=doc_url,
+            catalog_path=catalog_path,
+            updated_at=updated_at,
+            kind="doc",
+            images=images,
+        )
+    ]
+
+
 def split_qa_from_raw(
     raw: str,
     *,
@@ -184,9 +454,27 @@ def split_qa_from_raw(
     """从原始 HTML/Markdown 按 Q/A 切分，并给每条挂上块内图片。"""
     chunks = _qa_raw_chunks(raw)
     if not chunks:
-        # 回退：纯文本切分（无逐条图片）
-        return split_qa_sections(
-            markdown_or_html_to_text(raw),
+        chunks = _numbered_qa_raw_chunks(raw)
+    if not chunks:
+        text = markdown_or_html_to_text(raw)
+        sections = split_qa_sections(
+            text,
+            doc_id=doc_id,
+            slug=slug,
+            doc_title=doc_title,
+            doc_url=doc_url,
+            catalog_path=catalog_path,
+            updated_at=updated_at,
+            images=extract_images(raw),
+            id_prefix=id_prefix,
+            parent_title=parent_title,
+            parent_url=parent_url,
+            parent_anchor=parent_anchor,
+        )
+        if sections:
+            return sections
+        return split_numbered_qa_sections(
+            text,
             doc_id=doc_id,
             slug=slug,
             doc_title=doc_title,
@@ -203,6 +491,27 @@ def split_qa_from_raw(
     sections: list[DocSection] = []
     for idx, chunk in enumerate(chunks):
         body = markdown_or_html_to_text(chunk)
+        numbered = _parse_numbered_qa_chunk(body)
+        if numbered:
+            label, question, answer = numbered
+            _append_numbered_qa_section(
+                sections,
+                idx=idx,
+                label=label,
+                question=question,
+                answer=answer,
+                doc_id=doc_id,
+                slug=slug,
+                doc_title=doc_title,
+                doc_url=doc_url,
+                catalog_path=catalog_path,
+                updated_at=updated_at,
+                id_prefix=id_prefix,
+                parent_url=parent_url or doc_url,
+                parent_anchor=parent_anchor,
+                images=extract_images(chunk),
+            )
+            continue
         match = QA_BLOCK_RE.search("\n" + body)
         if not match:
             # 兼容「Q：问题」后直接跟图片再跟 A：
@@ -297,7 +606,7 @@ def split_anchor_markdown(
     sections: list[DocSection] = []
     matches = list(HEADING_RE.finditer(raw or ""))
     if not matches:
-        qa_sections = split_qa_from_raw(
+        return _split_plain_document(
             raw,
             doc_id=doc_id,
             slug=slug,
@@ -306,27 +615,6 @@ def split_anchor_markdown(
             catalog_path=catalog_path,
             updated_at=updated_at,
         )
-        if qa_sections:
-            return qa_sections
-        body = markdown_or_html_to_text(raw)
-        sections.append(
-            DocSection(
-                id=f"{doc_id}:root",
-                doc_id=doc_id,
-                slug=slug,
-                doc_title=doc_title,
-                section_title=doc_title,
-                section_anchor="",
-                content=body,
-                url=doc_url,
-                doc_url=doc_url,
-                catalog_path=catalog_path,
-                updated_at=updated_at,
-                kind="doc",
-                images=extract_images(raw),
-            )
-        )
-        return sections
 
     # 文首到第一个标题之间的前言
     preface_raw = raw[: matches[0].start()]
@@ -344,7 +632,7 @@ def split_anchor_markdown(
         )
         if preface_qa:
             sections.extend(preface_qa)
-        else:
+        elif len(preface) >= 120 or extract_images(preface_raw):
             sections.append(
                 DocSection(
                     id=f"{doc_id}:preface",
@@ -423,10 +711,68 @@ def extract_answer_text(content: str) -> str:
     if not text:
         return ""
     match = re.search(r"A[:：]\s*(.+?)(?=(?:\n\s*Q[:：])|$)", text, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return ""
-    answer = re.sub(r"\s+", " ", match.group(1)).strip(" ；;，,")
-    return answer[:500]
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip(" ；;，,")[:500]
+    numbered = _parse_numbered_qa_chunk(text)
+    if numbered:
+        _label, _question, answer = numbered
+        return re.sub(r"\s+", " ", answer).strip(" ；;，,")[:500]
+    return ""
+
+
+def split_numbered_qa_sections(
+    text: str,
+    *,
+    doc_id: str,
+    slug: str,
+    doc_title: str,
+    doc_url: str,
+    catalog_path: list[str],
+    updated_at: str = "",
+    images: list[str] | None = None,
+    id_prefix: str = "qa",
+    parent_title: str = "",
+    parent_url: str = "",
+    parent_anchor: str = "",
+) -> list[DocSection]:
+    """把 Q1：/Q2： 编号 FAQ 拆成独立检索条目。"""
+    source = (text or "").strip()
+    if not source:
+        return []
+    hits = list(NUMBERED_QA_MARKER_RE.finditer(source))
+    if len(hits) < 2:
+        return []
+    sections: list[DocSection] = []
+    shared_images = list(images or [])
+    for idx, hit in enumerate(hits):
+        label = hit.group(1).upper()
+        block_start = hit.end()
+        block_end = hits[idx + 1].start() if idx + 1 < len(hits) else len(source)
+        block = source[block_start:block_end].strip()
+        lines = block.split("\n", 1)
+        question = re.sub(r"\s+", " ", lines[0]).strip()
+        answer = lines[1].strip() if len(lines) > 1 else ""
+        if len(question) < 4:
+            continue
+        item_images = shared_images if (idx == 0 or len(shared_images) <= 2) else []
+        _append_numbered_qa_section(
+            sections,
+            idx=idx,
+            label=label,
+            question=question,
+            answer=answer,
+            doc_id=doc_id,
+            slug=slug,
+            doc_title=doc_title,
+            doc_url=doc_url,
+            catalog_path=catalog_path,
+            updated_at=updated_at,
+            id_prefix=id_prefix,
+            parent_url=parent_url or doc_url,
+            parent_anchor=parent_anchor,
+            images=item_images,
+        )
+    return sections
 
 
 def split_qa_sections(

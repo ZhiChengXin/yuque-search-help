@@ -208,20 +208,50 @@ function renderSuggestions(mode, items) {
   paintSuggestions(items && items.length ? items : fallbackSuggestions(mode));
 }
 
-async function loadSuggestions(mode) {
+function searchBtnIconHtml() {
+  return `<svg class="search-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+    <path fill="currentColor" d="M10.5 3a7.5 7.5 0 0 1 5.9 12.1l4.25 4.25a1 1 0 0 1-1.4 1.4l-4.26-4.24A7.5 7.5 0 1 1 10.5 3zm0 2a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11z"/>
+  </svg>`;
+}
+
+function setSearchBtnLoading(loading) {
+  const btn = $("searchBtn");
+  if (!btn) return;
+  btn.disabled = Boolean(loading);
+  btn.classList.toggle("is-loading", Boolean(loading));
+  btn.innerHTML = searchBtnIconHtml();
+  btn.setAttribute("aria-label", loading ? "检索中" : "检索");
+  btn.title = loading ? "检索中" : "检索";
+}
+
+async function loadSuggestions(mode, { spinning = false } = {}) {
   const target = mode || currentMode;
-  renderSuggestions(target, fallbackSuggestions(target));
+  const refreshBtn = $("suggestRefresh");
+  if (spinning && refreshBtn) {
+    refreshBtn.disabled = true;
+    refreshBtn.classList.add("is-loading");
+  }
+  if (!spinning) {
+    renderSuggestions(target, fallbackSuggestions(target));
+  }
   try {
     const res = await fetch(
-      `/api/suggest?mode=${encodeURIComponent(target)}&limit=6`
+      `/api/suggest?mode=${encodeURIComponent(target)}&limit=6&_=${Date.now()}`
     );
     const data = await res.json();
     if (target !== currentMode) return;
     if (data.ok && Array.isArray(data.items) && data.items.length) {
       renderSuggestions(target, data.items);
+    } else if (spinning) {
+      renderSuggestions(target, fallbackSuggestions(target));
     }
   } catch {
     // 保持兜底示例
+  } finally {
+    if (refreshBtn) {
+      refreshBtn.disabled = false;
+      refreshBtn.classList.remove("is-loading");
+    }
   }
 }
 
@@ -497,9 +527,9 @@ function renderResults(query, payload) {
     .join("");
 }
 
-function openFeedbackWithQuery(_query) {
-  // 未命中时走默认空输入框与 placeholder，不自动填充检索词
-  openFeedback();
+function openFeedbackWithQuery(query) {
+  const seed = (query || $("q").value || "").trim();
+  openFeedback({ seedText: seed });
 }
 
 async function doSearch(query, { fast = false } = {}) {
@@ -508,15 +538,14 @@ async function doSearch(query, { fast = false } = {}) {
   const isOwner = currentMode === "owner";
   const waitText = isOwner ? "正在匹配…" : "正在检索…";
   $("q").value = q;
-  $("searchBtn").disabled = true;
-  $("searchBtn").innerHTML = `<span>${isOwner ? "匹配中" : "检索中"}</span>`;
+  setSearchBtnLoading(true);
   showIntroNote(false);
   setNotice("", "");
   $("results").innerHTML = loadingHtml(waitText);
   $("contacts").hidden = true;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 45000);
+  const timer = setTimeout(() => controller.abort(), 35000);
   try {
     const res = await fetch(
       `/api/search?q=${encodeURIComponent(q)}&limit=12&mode=${encodeURIComponent(currentMode)}&fast=${fast ? "1" : "0"}`,
@@ -546,8 +575,7 @@ async function doSearch(query, { fast = false } = {}) {
     );
   } finally {
     clearTimeout(timer);
-    $("searchBtn").disabled = false;
-    $("searchBtn").innerHTML = "<span>立即检索</span>";
+    setSearchBtnLoading(false);
   }
 }
 
@@ -602,6 +630,10 @@ $("suggestGrid").addEventListener("click", (e) => {
   if (!btn) return;
   showIntroNote(false);
   openSuggestion(btn.dataset.q, btn.dataset.id || "");
+});
+
+$("suggestRefresh").addEventListener("click", () => {
+  loadSuggestions(currentMode, { spinning: true });
 });
 
 let lightboxUserZoom = 1;
@@ -800,7 +832,7 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-$("syncBtn").addEventListener("click", async () => {
+$("syncBtn") && $("syncBtn").addEventListener("click", async () => {
   $("syncBtn").disabled = true;
   setStatus("同步中", "正在刷新知识库…", "loading");
   try {
@@ -825,25 +857,89 @@ function renderFeedbackShots() {
     .join("");
 }
 
-function openFeedback() {
-  $("feedbackMask").hidden = false;
+function resetFeedbackForm() {
+  $("feedbackText").value = "";
+  feedbackImages.length = 0;
+  renderFeedbackShots();
   if ($("feedbackTip")) {
     $("feedbackTip").textContent = "可在输入框内粘贴截图，最多 6 张";
   }
+  $("feedbackSubmit").disabled = false;
+  $("feedbackSubmit").textContent = "提交反馈";
+}
+
+function openFeedback({ seedText = "" } = {}) {
+  resetFeedbackForm();
+  const seed = String(seedText || "").trim();
+  if (seed) {
+    $("feedbackText").value = seed;
+  }
+  $("feedbackMask").hidden = false;
   $("feedbackText").focus();
+  if (seed) {
+    const el = $("feedbackText");
+    const len = el.value.length;
+    el.setSelectionRange(len, len);
+  }
 }
 
 function closeFeedback() {
   $("feedbackMask").hidden = true;
+  resetFeedbackForm();
 }
 
-function addFeedbackImage(dataUrl) {
+/** 压缩截图，显著缩短提交时上传语雀的耗时 */
+function compressFeedbackImage(dataUrl, maxW = 1280, quality = 0.72) {
+  return new Promise((resolve) => {
+    if (!dataUrl || !String(dataUrl).startsWith("data:image/")) {
+      resolve(dataUrl);
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      try {
+        let w = img.naturalWidth || img.width;
+        let h = img.naturalHeight || img.height;
+        if (!w || !h) {
+          resolve(dataUrl);
+          return;
+        }
+        if (w > maxW) {
+          h = Math.round((h * maxW) / w);
+          w = maxW;
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(dataUrl);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, w, h);
+        const out = canvas.toDataURL("image/jpeg", quality);
+        resolve(out && out.length < String(dataUrl).length ? out : dataUrl);
+      } catch {
+        resolve(dataUrl);
+      }
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+async function addFeedbackImage(dataUrl) {
   if (!dataUrl || !String(dataUrl).startsWith("data:image/")) return false;
   if (feedbackImages.length >= 6) {
     $("feedbackTip").textContent = "最多粘贴 6 张截图";
     return false;
   }
-  feedbackImages.push(String(dataUrl));
+  const compressed = await compressFeedbackImage(dataUrl);
+  if (feedbackImages.length >= 6) {
+    $("feedbackTip").textContent = "最多粘贴 6 张截图";
+    return false;
+  }
+  feedbackImages.push(String(compressed));
   renderFeedbackShots();
   $("feedbackTip").textContent = `已添加截图（${feedbackImages.length}/6）`;
   return true;
@@ -855,7 +951,7 @@ function collectPasteImages(clipboardData) {
   let added = 0;
   for (const item of items) {
     if (!item.type.startsWith("image/")) continue;
-    if (feedbackImages.length >= 6) break;
+    if (feedbackImages.length + added >= 6) break;
     const file = item.getAsFile();
     if (!file) continue;
     const reader = new FileReader();
@@ -905,12 +1001,14 @@ $("feedbackForm").addEventListener("submit", async (e) => {
       }),
     });
     const data = await res.json();
-    $("feedbackTip").textContent = data.message || (data.ok ? "已提交" : "提交失败");
     if (data.ok) {
       $("feedbackText").value = "";
       feedbackImages.length = 0;
       renderFeedbackShots();
-      setTimeout(closeFeedback, 900);
+      $("feedbackTip").textContent = "已提交";
+      setTimeout(closeFeedback, 500);
+    } else {
+      $("feedbackTip").textContent = data.message || "提交失败";
     }
   } catch {
     $("feedbackTip").textContent = "提交失败，请确认服务已启动";

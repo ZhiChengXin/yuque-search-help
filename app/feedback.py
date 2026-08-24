@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -40,14 +42,14 @@ def _title_from_description(description: str, has_images: bool) -> str:
     return text or "问题反馈"
 
 
-def save_feedback(
-    settings: Settings,
+def prepare_feedback(
     *,
     description: str,
     images: list[str],
     query: str = "",
     mode: str = "",
 ) -> dict[str, Any]:
+    """同步校验并解析截图；通过后由后台任务写入语雀。"""
     text = (description or "").strip()
     if not text and not images:
         return {"ok": False, "message": "请填写问题描述，或粘贴截图后再提交"}
@@ -75,22 +77,70 @@ def save_feedback(
         "query": query,
         "mode": mode,
     }
+    return {
+        "ok": True,
+        "message": "已提交",
+        "title": record["title"],
+        "record": record,
+        "parsed_images": parsed_images,
+    }
+
+
+def run_feedback_job(
+    settings: Settings,
+    record: dict[str, Any],
+    parsed_images: list[tuple[str, str, bytes]],
+) -> None:
+    """后台写入语雀；失败只记日志，不影响用户侧提交成功。"""
+    started = time.perf_counter()
     try:
         _append_yuque(settings, record, parsed_images)
+        logger.info(
+            "feedback background saved title=%s images=%s elapsed=%.2fs",
+            record.get("title"),
+            len(parsed_images),
+            time.perf_counter() - started,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "feedback background write failed title=%s images=%s",
+            record.get("title"),
+            len(parsed_images),
+        )
+
+
+def save_feedback(
+    settings: Settings,
+    *,
+    description: str,
+    images: list[str],
+    query: str = "",
+    mode: str = "",
+) -> dict[str, Any]:
+    """同步写入（脚本/测试用）。"""
+    prepared = prepare_feedback(
+        description=description,
+        images=images,
+        query=query,
+        mode=mode,
+    )
+    if not prepared.get("ok"):
+        return {"ok": False, "message": prepared.get("message", "提交失败")}
+    try:
+        _append_yuque(settings, prepared["record"], prepared["parsed_images"])
     except Exception as exc:  # noqa: BLE001
         logger.exception("反馈写入语雀失败")
         message = str(exc)
-        if "401" in message or "权限" in message:
+        if "401" in message or "权限" in message or "图集" in message:
             return {
                 "ok": False,
                 "message": "未能写入语雀：请确认 Token 已勾选文档权限与「修改和读取你的图集」",
             }
         return {"ok": False, "message": f"未能写入语雀，请稍后重试（{message[:80]}）"}
-
     return {
         "ok": True,
         "message": "反馈已写入内部文档",
-        "title": record["title"],
+        "title": prepared["title"],
     }
 
 
@@ -128,16 +178,52 @@ def _append_yuque(
         token=settings.yuque_token,
     )
     try:
+        t0 = time.perf_counter()
         doc = client.get_doc(ns, slug)
+        t_get = time.perf_counter() - t0
         doc_title = doc.get("title") or "售后反馈"
         doc_id = str(doc.get("id") or "")
-        image_urls = [
-            client.upload_image(f"feedback-{i}.{ext}", raw, mime, doc_id=doc_id)
-            for i, (mime, ext, raw) in enumerate(parsed_images, 1)
-        ]
-        md_block = _to_markdown(record, image_urls)
         old = (doc.get("body") or "").rstrip()
+
+        image_urls: list[str] = [""] * len(parsed_images)
+        t_up = 0.0
+        if parsed_images:
+            t1 = time.perf_counter()
+
+            def _one(idx_item: tuple[int, tuple[str, str, bytes]]) -> tuple[int, str]:
+                i, (mime, ext, raw) = idx_item
+                url = client.upload_image(
+                    f"feedback-{i}.{ext}",
+                    raw,
+                    mime,
+                    doc_id=doc_id,
+                    allow_data_uri=False,
+                )
+                return i - 1, url
+
+            workers = min(4, len(parsed_images))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(_one, (i, item))
+                    for i, item in enumerate(parsed_images, 1)
+                ]
+                for fut in as_completed(futures):
+                    idx, url = fut.result()
+                    image_urls[idx] = url
+            t_up = time.perf_counter() - t1
+
+        md_block = _to_markdown(record, image_urls)
         body = f"{old}\n\n{md_block}".strip() if old else md_block.strip()
+        t2 = time.perf_counter()
         client.update_doc_markdown(ns, slug, doc_title, body)
+        t_put = time.perf_counter() - t2
+        logger.info(
+            "feedback yuque get=%.2fs upload=%.2fs update=%.2fs images=%s old_body=%s",
+            t_get,
+            t_up,
+            t_put,
+            len(parsed_images),
+            len(old),
+        )
     finally:
         client.close()

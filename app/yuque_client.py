@@ -266,9 +266,7 @@ class YuqueClient:
                 )
                 return contact_sections, parsed
 
-            raw = ""
-            if not self.token:
-                raw = self.fetch_anchor_markdown(slug)
+            raw = self.fetch_anchor_markdown(slug)
             if not raw:
                 raw = detail.get("body_html") or detail.get("body") or ""
             split = split_anchor_markdown(
@@ -312,6 +310,8 @@ class YuqueClient:
         content: bytes,
         mime: str = "image/png",
         doc_id: str = "",
+        *,
+        allow_data_uri: bool = True,
     ) -> str:
         data: dict[str, str] = {"type": "image"}
         if doc_id:
@@ -336,6 +336,10 @@ class YuqueClient:
                 return url
             raise RuntimeError(f"上传截图未返回地址: {str(payload)[:240]}")
         if resp.status_code == 401 and "attach_upload" in (resp.text or ""):
+            if not allow_data_uri:
+                raise RuntimeError(
+                    "上传截图失败：Token 缺少图集权限（attach_upload），请勾选「修改和读取你的图集」"
+                )
             encoded = base64.b64encode(content).decode("ascii")
             return f"data:{mime};base64,{encoded}"
         raise RuntimeError(f"上传截图失败 HTTP {resp.status_code}: {resp.text[:300]}")

@@ -51,6 +51,42 @@ STOPWORDS = {
     "没有",
 }
 
+# 界面/场景描述词：常被用户顺口带上，文档标题未必出现，不能因此判未命中
+CONTEXT_STOPWORDS = {
+    "列表",
+    "页面",
+    "界面",
+    "模块",
+    "系统",
+    "里面",
+    "上面",
+    "下面",
+    "里边",
+    "功能",
+    "菜单",
+    "入口",
+    "按钮",
+    "选项",
+    "地方",
+    "时候",
+    "情况",
+    "那边",
+    "这边",
+    "那里",
+    "这里",
+    "一下",
+    "那种",
+    "这种",
+    "操作",
+    "打开",
+    "进入",
+    "点击",
+    "看到",
+    "显示的",
+    "里面的",
+}
+
+
 
 def tokenize(text: str) -> list[str]:
     text = (text or "").strip().lower()
@@ -82,8 +118,8 @@ def soften_query(query: str) -> str:
     return re.sub(r"([\u4e00-\u9fff])\1+", r"\1", text)
 
 
-def query_tokens(query: str) -> list[str]:
-    """原句 + 口语归一 + 同义词扩展后的分词，提升召回。"""
+def base_query_tokens(query: str) -> list[str]:
+    """原句分词（不含同义词扩展），用于门禁，避免扩展词误杀。"""
     seen = set()
     out: list[str] = []
     for source in (query, soften_query(query)):
@@ -91,7 +127,21 @@ def query_tokens(query: str) -> list[str]:
             if t not in seen:
                 seen.add(t)
                 out.append(t)
-    return expand_terms(out)
+    return out
+
+
+def gate_query_tokens(query: str) -> list[str]:
+    """门禁/覆盖率用的实质词：原句分词，去掉停用词与界面场景词。"""
+    return [
+        t
+        for t in base_query_tokens(query)
+        if len(t) >= 2 and t not in STOPWORDS and t not in CONTEXT_STOPWORDS
+    ]
+
+
+def query_tokens(query: str) -> list[str]:
+    """原句 + 口语归一 + 同义词扩展后的分词，提升召回。"""
+    return expand_terms(base_query_tokens(query))
 
 
 def _lexical_bridge(query: str, title: str, content: str = "", answer: str = "") -> bool:
@@ -122,13 +172,32 @@ def _lexical_bridge(query: str, title: str, content: str = "", answer: str = "")
     if not tokens:
         return False
     blob = soften_query(
-        f"{title or ''} {answer or ''} {(content or '')[:240]}"
+        f"{title or ''} {answer or ''} {(content or '')[:400]}"
     ).lower()
     hits = sum(1 for t in tokens if soften_query(t).lower() in blob or t.lower() in blob)
     strong = [t for t in tokens if len(t) >= 3]
     if strong and any(soften_query(t).lower() in blob or t.lower() in blob for t in strong):
         return True
-    return hits / max(len(tokens), 1) >= 0.28
+    return hits / max(len(tokens), 1) >= 0.18
+
+
+def _rrf_fuse(
+    bm25_ids: list[str],
+    vector_ids: list[str],
+    *,
+    k: int = 60,
+) -> dict[str, float]:
+    """Reciprocal Rank Fusion：多路召回免调参融合。"""
+    scores: dict[str, float] = {}
+    for rank, sid in enumerate(bm25_ids):
+        if not sid:
+            continue
+        scores[sid] = scores.get(sid, 0.0) + 1.0 / (k + rank + 1)
+    for rank, sid in enumerate(vector_ids):
+        if not sid:
+            continue
+        scores[sid] = scores.get(sid, 0.0) + 1.0 / (k + rank + 1)
+    return scores
 
 
 def make_snippet(text: str, query: str, radius: int = 70) -> str:
@@ -253,9 +322,14 @@ def extract_answer_from_content(content: str) -> str:
     if not text:
         return ""
     match = re.search(r"A[:：]\s*(.+?)(?=(?:\n\s*Q[:：])|$)", text, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return ""
-    return re.sub(r"\s+", " ", match.group(1)).strip(" ；;，,")[:500]
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip(" ；;，,")[:500]
+    numbered = re.match(r"^Q\d+\s*[:：]\s*.+$", text, re.IGNORECASE | re.DOTALL)
+    if numbered:
+        body = re.sub(r"^Q\d+\s*[:：]\s*[^\n]+\n?", "", text, count=1, flags=re.IGNORECASE).strip()
+        if body:
+            return re.sub(r"\s+", " ", body).strip(" ；;，,")[:500]
+    return ""
 
 
 class SearchEngine:
@@ -383,6 +457,11 @@ class SearchEngine:
                 coverage = len(hit_tokens) / max(len(q_tokens), 1)
                 bonus += coverage * 4.0
 
+                # 门禁覆盖率：只用原句实质词，避免同义词扩展 +「列表/页面」把召回提前踢掉
+                gate_toks = gate_query_tokens(query)
+                gate_hits = [t for t in gate_toks if t in content_l]
+                gate_coverage = len(gate_hits) / max(len(gate_toks), 1) if gate_toks else 1.0
+
                 # 正文充实、带图的章节优先，避免空壳标题霸榜
                 content_len = len(sec.content or "")
                 if content_len >= 120:
@@ -399,17 +478,16 @@ class SearchEngine:
                     bonus -= 6.0
 
                 final_score = float(score) + bonus
-                # 精确标题永远保留；弱匹配过滤
+                # 精确标题永远保留；弱匹配过滤（阈值放宽，让长口语问法先进候选池）
                 if exact_section or near_section:
                     pass
-                elif final_score < 1.2 or coverage < 0.45:
-                    # 至少要有一个长度>=2 的实质词命中
-                    meaningful = [t for t in hit_tokens if len(t) >= 2]
-                    if len(meaningful) < max(1, int(len(q_tokens) * 0.34)):
+                elif final_score < 1.0 or gate_coverage < 0.28:
+                    meaningful = [t for t in gate_hits if len(t) >= 2]
+                    if len(meaningful) < max(1, int(len(gate_toks) * 0.28)):
                         continue
-                    if final_score < 2.5 and not meaningful:
+                    if final_score < 2.0 and not meaningful:
                         continue
-                    if final_score < 3.5 and coverage < 0.5 and not (
+                    if final_score < 3.0 and gate_coverage < 0.4 and not (
                         any(t in title_l for t in meaningful)
                     ):
                         continue
@@ -450,7 +528,7 @@ class SearchEngine:
 
             results.sort(key=lambda x: x["score"], reverse=True)
             if not keep_weak:
-                # 二次门禁：若最高分仍偏低且无标题命中，视为未命中文档
+                # 二次门禁：不再「一刀切清空」；优先丢掉明显跑偏的，保留还能对上实质词的
                 if results:
                     top = results[0]
                     top_title = (top.get("title") or "").lower()
@@ -460,21 +538,42 @@ class SearchEngine:
                         or top_title in query_lower
                         or top.get("score", 0) >= 8
                     )
-                    meaningful_q = [t for t in q_tokens if len(t) >= 2]
-                    top_blob = f"{top_title} {(top.get('snippet') or '').lower()}"
+                    meaningful_q = gate_query_tokens(query)
+
+                    def _blob(item: dict[str, Any]) -> str:
+                        return (
+                            f"{(item.get('title') or '').lower()} "
+                            f"{(item.get('snippet') or '').lower()} "
+                            f"{(item.get('doc_title') or '').lower()} "
+                            f"{' '.join(item.get('catalog_path') or []).lower()}"
+                        )
+
+                    top_blob = _blob(top)
                     hit_ratio = (
                         sum(1 for t in meaningful_q if t in top_blob) / max(len(meaningful_q), 1)
                     )
-                    rare_miss = any(
-                        len(t) >= 4 and t not in top_blob and not any(
-                            t in (r.get("title") or "").lower()
-                            or t in (r.get("snippet") or "").lower()
-                            for r in results[:3]
-                        )
+                    # 长词（>=4）若整份候选前几名都没有，才从候选里剔除「完全不含该词」的项
+                    rare_terms = [
+                        t
                         for t in meaningful_q
-                    )
-                    if rare_miss or (not strong and (top.get("score", 0) < 6 or hit_ratio < 0.5)):
+                        if len(t) >= 4
+                        and not any(t in _blob(r) for r in results[:8])
+                    ]
+                    if rare_terms:
+                        # 有罕见词全库都没命中 → 多半问法太偏；但若分数已经很高仍保留前几名供向量/上层兜底
+                        if not strong or hit_ratio < 0.35:
+                            results = []
+                    elif not strong and top.get("score", 0) < 5 and hit_ratio < 0.35:
                         results = []
+                    else:
+                        # 顶名偏了但不至于全空：把覆盖更好的结果往前挪
+                        results.sort(
+                            key=lambda r: (
+                                sum(1 for t in meaningful_q if t in _blob(r)),
+                                float(r.get("score") or 0),
+                            ),
+                            reverse=True,
+                        )
 
             results = results[:pull]
             self._normalize_match_percent(results)
@@ -557,25 +656,32 @@ class SearchEngine:
         if vector_index is None or not getattr(vector_index, "enabled", False):
             return results
         soft = soften_query(query) or query
+        min_score = 0.32 if keep_weak else 0.36
         try:
-            # 用归一后的问法做语义检索，阈值略提高减少噪声
-            hits = vector_index.search(soft, top_k=max(12, pull), min_score=0.36)
+            hits = vector_index.search(
+                soft, top_k=max(40, pull * 2), min_score=min_score
+            )
         except Exception:
             return results
         if not hits:
             return results
 
+        bm25_ids = [str(item.get("id") or "") for item in results if item.get("id")]
+        bm25_set = set(bm25_ids)
         by_id = {item.get("id"): item for item in results}
         query_lower = (query or "").lower()
         soft_lower = soft.lower()
+        vector_ids: list[str] = []
+
         for sid, sim in hits:
             sec = self._by_id.get(sid)
             if not sec:
                 continue
             sim_f = float(sim)
+            vector_ids.append(sid)
             existing = by_id.get(sid)
             if existing:
-                if sim_f >= 0.36:
+                if sim_f >= min_score:
                     vec_score = 4.0 + sim_f * 18.0
                     existing["score"] = round(
                         max(float(existing.get("score") or 0), vec_score), 4
@@ -584,13 +690,13 @@ class SearchEngine:
                     existing["vector_hit"] = True
                 continue
 
-            # 纯向量新进候选：要求更高相似度 + 字面/同义词桥接
-            if sim_f < 0.45:
+            # 纯向量新进：高相似可放宽字面桥接
+            if sim_f < 0.42:
                 continue
-            if not _lexical_bridge(query, sec.section_title, sec.content, sec.answer):
+            bridged = _lexical_bridge(query, sec.section_title, sec.content, sec.answer)
+            if not bridged and sim_f < 0.55:
                 continue
-            # fast 模式更严，避免无关问题刷屏
-            if not keep_weak and sim_f < 0.50:
+            if not keep_weak and sim_f < 0.48 and not bridged:
                 continue
 
             exact_section = titles_exact_match(query, sec.section_title) or titles_exact_match(
@@ -617,7 +723,6 @@ class SearchEngine:
             by_id[sid] = item
 
         merged = list(by_id.values())
-        # 二次清洗：仅有弱向量、无字面桥接的踢掉
         cleaned: list[dict[str, Any]] = []
         for item in merged:
             if item.get("exact_title"):
@@ -629,17 +734,37 @@ class SearchEngine:
                 content = (sec.content if sec else "") or ""
                 answer = (item.get("answer") or "")
                 sim_f = float(item.get("vector_score") or 0)
-                # BM25 原有结果：保留；纯向量需桥接
-                was_bm25 = any(r.get("id") == item.get("id") for r in results)
+                was_bm25 = (item.get("id") or "") in bm25_set
                 if was_bm25:
                     cleaned.append(item)
                     continue
-                if sim_f >= 0.45 and _lexical_bridge(query, title, content, answer):
+                if sim_f >= 0.55:
+                    cleaned.append(item)
+                    continue
+                if sim_f >= 0.42 and _lexical_bridge(query, title, content, answer):
                     cleaned.append(item)
                 continue
             cleaned.append(item)
 
-        cleaned.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
+        # RRF 融合 BM25 顺序与向量顺序
+        rrf = _rrf_fuse(bm25_ids, vector_ids)
+        for item in cleaned:
+            rid = str(item.get("id") or "")
+            item["rrf_score"] = round(rrf.get(rid, 0.0), 6)
+            # 把 RRF 轻微并入内部 score，利于后续排序
+            item["score"] = round(
+                float(item.get("score") or 0) + float(item.get("rrf_score") or 0) * 40.0,
+                4,
+            )
+
+        cleaned.sort(
+            key=lambda x: (
+                float(x.get("rrf_score") or 0),
+                float(x.get("vector_score") or 0),
+                float(x.get("score") or 0),
+            ),
+            reverse=True,
+        )
         merged = cleaned[:pull]
         self._normalize_match_percent(merged)
         return merged
@@ -911,25 +1036,45 @@ class SearchEngine:
 
     @staticmethod
     def _score_to_percent(score: float, *, exact: bool, near: bool) -> float:
+        """关键词分 → 展示百分比。刻意保守：标题沾边不等于高置信。"""
         if exact:
             return 100.0
         if near:
-            return round(min(96.0, 72.0 + score), 1)
-        mapped = 18.0 + max(0.0, score) * 4.2
-        return round(min(88.0, mapped), 1)
+            # 标题包含/被包含：最多约 78，避免动辄 96%
+            return round(min(78.0, 50.0 + max(0.0, score) * 0.85), 1)
+        mapped = 10.0 + max(0.0, score) * 2.8
+        return round(min(66.0, mapped), 1)
 
     @staticmethod
     def _normalize_match_percent(results: list[dict[str, Any]]) -> None:
+        """用向量语义校正百分比；不做「第一条人为抬分」。"""
         if not results:
             return
-        percents = [float(r.get("match_percent") or 0) for r in results]
-        top = max(percents) if percents else 0
-        if top >= 99.5:
-            return
-        # 让第一条更直观地成为「最佳匹配」
-        if percents[0] < 92 and percents[0] >= 55:
-            results[0]["match_percent"] = round(min(99.0, percents[0] + 8), 1)
-            results[0]["match_hint"] = f"匹配度 {results[0]['match_percent']:.1f}%"
+        for r in results:
+            if r.get("exact_title"):
+                r["match_percent"] = 100.0
+                r["match_hint"] = "匹配度 100.0%"
+                continue
+
+            base = float(r.get("match_percent") or 0)
+            vec = float(r.get("vector_score") or 0)
+            if vec > 0:
+                # cosine 约 0.30~0.85 → 语义分约 32~90
+                sem = min(90.0, max(0.0, (vec - 0.30) / 0.55) * 78.0 + 32.0)
+                pct = sem * 0.72 + base * 0.28
+            else:
+                # 无向量信号时再压一档，避免纯字面虚高
+                pct = base * 0.82
+
+            if vec and vec < 0.42:
+                pct = min(pct, 78.0)
+            elif not vec:
+                pct = min(pct, 74.0)
+            else:
+                pct = min(pct, 90.0)
+
+            r["match_percent"] = round(max(0.0, pct), 1)
+            r["match_hint"] = f"匹配度 {r['match_percent']:.1f}%"
 
     @staticmethod
     def _section_fits_mode(sec: DocSection, mode: str) -> bool:

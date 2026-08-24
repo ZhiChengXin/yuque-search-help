@@ -32,15 +32,93 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
-def embed_text_for_section(title: str, content: str, answer: str = "") -> str:
-    """章节用于向量化的短文本（控制长度，降低费用）。"""
+def parent_section_id(chunk_id: str) -> str:
+    """子块 id（sec#c0）还原为章节 id。"""
+    cid = (chunk_id or "").strip()
+    if "#c" in cid:
+        return cid.rsplit("#c", 1)[0]
+    return cid
+
+
+def split_body_chunks(
+    body: str,
+    *,
+    size: int = 520,
+    overlap: int = 90,
+    max_chunks: int = 4,
+) -> list[str]:
+    """长正文按重叠窗口切分，避免一整章糊成一个向量。"""
+    text = (body or "").strip()
+    if not text:
+        return [""]
+    if len(text) <= size:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < len(text) and len(chunks) < max_chunks:
+        end = min(len(text), start + size)
+        if end < len(text):
+            br = text.rfind("\n", start + size // 2, end)
+            if br > start:
+                end = br
+        piece = text[start:end].strip()
+        if piece:
+            chunks.append(piece)
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return chunks or [text[:size]]
+
+
+def build_section_embed_items(
+    *,
+    section_id: str,
+    title: str,
+    content: str,
+    answer: str = "",
+    doc_title: str = "",
+    catalog_path: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """章节 → (chunk_id, text)；长文多块重叠，提升语义命中。"""
+    sid = (section_id or "").strip()
     title = (title or "").strip()
+    doc = (doc_title or "").strip()
+    path = " / ".join(p.strip() for p in (catalog_path or []) if (p or "").strip())
     ans = (answer or "").strip()
     body = (content or "").strip()
+    head_parts = [p for p in (path, doc, title) if p]
+    head = "\n".join(dict.fromkeys(head_parts))
     if ans:
-        body = f"A：{ans}\n{body}"
-    body = body[:900]
-    return f"{title}\n{body}".strip()
+        body = f"问：{title}\n答：{ans}\n{body}"
+    pieces = split_body_chunks(body)
+    out: list[tuple[str, str]] = []
+    for i, piece in enumerate(pieces):
+        text = f"{head}\n{piece}".strip()
+        if len(text) < 4:
+            continue
+        cid = sid if len(pieces) == 1 else f"{sid}#c{i}"
+        out.append((cid, text[:1800]))
+    return out
+
+
+def embed_text_for_section(
+    title: str,
+    content: str,
+    answer: str = "",
+    *,
+    doc_title: str = "",
+    catalog_path: list[str] | None = None,
+) -> str:
+    """兼容旧调用：返回首块文本。"""
+    items = build_section_embed_items(
+        section_id="_",
+        title=title,
+        content=content,
+        answer=answer,
+        doc_title=doc_title,
+        catalog_path=catalog_path,
+    )
+    return items[0][1] if items else ""
 
 
 class EmbeddingClient:
@@ -58,14 +136,14 @@ class EmbeddingClient:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
-    def embed_one(self, text: str) -> list[float]:
+    def embed_one(self, text: str, *, timeout: float = 6.0) -> list[float]:
         text = (text or "").strip() or " "
         key = f"{self.model}::{text[:2000]}"
         with self._cache_lock:
             hit = self._cache.get(key)
             if hit is not None:
                 return hit
-        vec = self.embed_batch([text])[0]
+        vec = self.embed_batch([text], timeout=timeout)[0]
         with self._cache_lock:
             if len(self._cache) >= self._cache_max:
                 # 丢掉最早一半
@@ -74,7 +152,7 @@ class EmbeddingClient:
             self._cache[key] = vec
         return vec
 
-    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    def embed_batch(self, texts: list[str], *, timeout: float = 8.0) -> list[list[float]]:
         if not texts:
             return []
         if not self.enabled:
@@ -102,7 +180,7 @@ class EmbeddingClient:
                 "X-Title": "Fumeng MX Help Search",
             }
             body = {"model": self.model, "input": missing_texts}
-            with httpx.Client(timeout=20.0) as client:
+            with httpx.Client(timeout=timeout) as client:
                 resp = client.post(url, headers=headers, json=body)
             if resp.status_code != 200:
                 raise RuntimeError(f"Embedding HTTP {resp.status_code}: {resp.text[:240]}")
@@ -186,14 +264,15 @@ class LocalVectorIndex:
             sid = getattr(sec, "id", "") or ""
             if not sid:
                 continue
-            text = embed_text_for_section(
-                getattr(sec, "section_title", "") or "",
-                getattr(sec, "content", "") or "",
-                getattr(sec, "answer", "") or "",
-            )
-            if len(text) < 4:
-                continue
-            items.append((sid, _content_hash(text), text))
+            for cid, text in build_section_embed_items(
+                section_id=sid,
+                title=getattr(sec, "section_title", "") or "",
+                content=getattr(sec, "content", "") or "",
+                answer=getattr(sec, "answer", "") or "",
+                doc_title=getattr(sec, "doc_title", "") or "",
+                catalog_path=list(getattr(sec, "catalog_path", None) or []),
+            ):
+                items.append((cid, _content_hash(text), text))
 
         old = {i: (h, v) for i, h, v in zip(self.ids, self.hashes, self.vectors)}
         new_ids: list[str] = []
@@ -222,7 +301,7 @@ class LocalVectorIndex:
         for start in range(0, len(pending_texts), batch_size):
             chunk = pending_texts[start : start + batch_size]
             try:
-                vectors = self.client.embed_batch(chunk)
+                vectors = self.client.embed_batch(chunk, timeout=30.0)
             except Exception as exc:
                 failed += len(chunk)
                 logger.exception("向量化失败，本批跳过：%s", exc)
@@ -265,11 +344,15 @@ class LocalVectorIndex:
         except Exception:
             logger.exception("查询向量化失败")
             return []
-        scored: list[tuple[str, float]] = []
+        best: dict[str, float] = {}
         with self._lock:
             for sid, vec in zip(self.ids, self.vectors):
                 score = _cosine(q_vec, vec)
-                if score >= min_score:
-                    scored.append((sid, score))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[: max(1, top_k)]
+                if score < min_score:
+                    continue
+                parent = parent_section_id(sid)
+                prev = best.get(parent)
+                if prev is None or score > prev:
+                    best[parent] = score
+        ranked = sorted(best.items(), key=lambda x: x[1], reverse=True)
+        return ranked[: max(1, top_k)]

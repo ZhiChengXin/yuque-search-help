@@ -4,14 +4,15 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, Query
-from fastapi.responses import FileResponse
+from fastapi import BackgroundTasks, FastAPI, Header, Query, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import get_settings
-from .feedback import save_feedback
+from .feedback import prepare_feedback, run_feedback_job
 from .index_service import KnowledgeIndex
 
 logging.basicConfig(
@@ -22,6 +23,8 @@ logger = logging.getLogger("yuque-help-search")
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+
+_webhook_sync_task: asyncio.Task | None = None
 
 
 class SearchRequest(BaseModel):
@@ -36,8 +39,34 @@ class FeedbackRequest(BaseModel):
     mode: str = Field("", max_length=20)
 
 
+async def _debounced_sync(index: KnowledgeIndex, delay: float, reason: str) -> None:
+    try:
+        await asyncio.sleep(max(0.5, delay))
+        logger.info("webhook 触发同步 reason=%s", reason)
+        result = await index.async_sync()
+        if not result.get("ok"):
+            logger.error("webhook 同步失败: %s", result.get("message"))
+        else:
+            logger.info(
+                "webhook 同步完成 sections=%s",
+                (result.get("section_count") or result.get("status", {}).get("section_count")),
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("webhook 同步异常")
+
+
+def schedule_webhook_sync(index: KnowledgeIndex, delay: float, reason: str) -> None:
+    global _webhook_sync_task
+    if _webhook_sync_task and not _webhook_sync_task.done():
+        _webhook_sync_task.cancel()
+    _webhook_sync_task = asyncio.create_task(_debounced_sync(index, delay, reason))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    get_settings.cache_clear()
     settings = get_settings()
     index = KnowledgeIndex(settings)
     app.state.index = index
@@ -58,6 +87,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        global _webhook_sync_task
+        if _webhook_sync_task and not _webhook_sync_task.done():
+            _webhook_sync_task.cancel()
         boot_task.cancel()
         sync_task.cancel()
 
@@ -91,7 +123,7 @@ async def status():
 @app.get("/api/search")
 async def search(
     q: str = Query(..., min_length=1, max_length=200),
-    limit: int = Query(10, ge=1, le=30),
+    limit: int = Query(5, ge=1, le=30),
     mode: str = Query("all", max_length=20),
     fast: bool = Query(False),
 ):
@@ -152,20 +184,74 @@ async def search_post(body: SearchRequest):
 
 @app.post("/api/sync")
 async def sync_now():
+    """内部/运维手动同步；页面已改为语雀 Webhook + 定时同步。"""
     index: KnowledgeIndex = app.state.index
     result = await index.async_sync()
     return {**result, "status": index.status()}
 
 
-@app.post("/api/feedback")
-async def feedback(body: FeedbackRequest):
+@app.post("/api/yuque/webhook")
+async def yuque_webhook(
+    request: Request,
+    token: str = Query("", max_length=200),
+    x_yuque_token: str | None = Header(default=None, alias="X-Yuque-Token"),
+):
+    """语雀知识库「消息推送」回调：文档发布/更新后防抖同步索引。"""
     settings = app.state.settings
-    result = await asyncio.to_thread(
-        save_feedback,
-        settings,
+    secret = (settings.yuque_webhook_secret or "").strip()
+    provided = (token or x_yuque_token or "").strip()
+    if secret and provided != secret:
+        return JSONResponse({"ok": False, "message": "unauthorized"}, status_code=401)
+
+    payload: Any
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    action = ""
+    title = ""
+    if isinstance(payload, dict):
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        action = str(
+            payload.get("webhook_subject_type")
+            or payload.get("action")
+            or payload.get("event")
+            or ""
+        )
+        if isinstance(data, dict):
+            title = str(data.get("title") or data.get("path") or "")[:120]
+    reason = f"{action}:{title}" if title or action else "yuque-webhook"
+    schedule_webhook_sync(
+        app.state.index,
+        float(settings.yuque_webhook_debounce_seconds or 12),
+        reason,
+    )
+    return {"ok": True, "accepted": True, "reason": reason}
+
+
+@app.post("/api/feedback")
+async def feedback(body: FeedbackRequest, background_tasks: BackgroundTasks):
+    settings = app.state.settings
+    prepared = await asyncio.to_thread(
+        prepare_feedback,
         description=body.description,
         images=body.images[:6],
         query=body.query,
         mode=body.mode,
     )
-    return result
+    if not prepared.get("ok"):
+        return {"ok": False, "message": prepared.get("message", "提交失败")}
+
+    record = prepared["record"]
+    parsed_images = prepared["parsed_images"]
+
+    async def _write_in_background() -> None:
+        await asyncio.to_thread(run_feedback_job, settings, record, parsed_images)
+
+    background_tasks.add_task(_write_in_background)
+    return {
+        "ok": True,
+        "message": "已提交",
+        "title": prepared.get("title") or "",
+    }

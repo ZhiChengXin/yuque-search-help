@@ -14,7 +14,7 @@
 | 运行方式 | Docker Compose（单容器） |
 | 依赖网络 | 容器需能访问外网（语雀同步 + OpenRouter 大模型/向量） |
 
-服务启动后会用 **语雀 Token** 同步知识库到内存索引，并写入本地向量缓存（`data/embeddings`）；之后按 `SYNC_INTERVAL_SECONDS`（默认 600 秒）定时刷新。
+服务启动后会用 **语雀 Token** 同步知识库到内存索引，并写入本地向量缓存（`data/embeddings`）；之后按 `SYNC_INTERVAL_SECONDS`（默认 600 秒）定时刷新。也可配置语雀 **Webhook**，文档发布/更新后自动同步。
 
 ---
 
@@ -95,10 +95,11 @@ YUQUE_FEEDBACK_SLUG=qr67p7rx343mvp9g
 # 大模型 / 向量（OpenRouter）
 LLM_API_KEY=你的 OpenRouter Key
 LLM_BASE_URL=https://openrouter.ai/api/v1
-LLM_MODEL=deepseek/deepseek-chat
+LLM_MODEL=qwen/qwen-2.5-72b-instruct
 EMBEDDING_ENABLED=true
 EMBEDDING_MODEL=qwen/qwen3-embedding-4b
 DATA_DIR=data
+YUQUE_WEBHOOK_SECRET=请改成随机字符串
 
 PORT=8787
 SYNC_INTERVAL_SECONDS=600
@@ -173,13 +174,21 @@ docker compose stop
 docker compose down
 ```
 
-### 手动触发知识库同步
+### 语雀 Webhook 自动同步（推荐）
 
-页面左侧有「刷新知识库」按钮；也可：
+1. 语雀知识库 → 设置 → **消息推送** → 其他渠道  
+2. Webhook 地址填（公网可访问）：
+   `http://<服务器IP>:8787/api/yuque/webhook?token=<YUQUE_WEBHOOK_SECRET>`
+3. 勾选：**发布文档**、**更新文档**（可按需加删除类事件）  
+4. 点「测试」；服务日志应出现 `webhook 触发同步`
+
+未配置公网或 Webhook 时，仍会按 `SYNC_INTERVAL_SECONDS` 定时同步。运维也可手动：
 
 ```bash
 curl -X POST http://127.0.0.1:8787/api/sync
 ```
+
+可选：在 `data/synonyms.json` 维护同义词组（无需改代码），格式见仓库内示例。
 
 ### 查看容器日志
 
@@ -240,7 +249,7 @@ server {
 | 构建很慢 / 拉基础镜像失败 | 配置 Docker `registry-mirrors` 后重试 |
 | pip 安装超时 | 确认 Dockerfile 仍使用清华源；检查出网代理 |
 | 端口冲突 | 修改 `docker-compose.yml` 中 `ports`，如 `"8080:8787"` |
-| 搜索结果为空 | 确认语雀知识库文档已发布；点「刷新知识库」后再试 |
+| 搜索结果为空 | 确认语雀知识库文档已发布；等待定时同步或触发 Webhook / `POST /api/sync` 后再试 |
 | 检索一直转圈 / 很慢 | 确认 OpenRouter 可访问；可临时设 `EMBEDDING_ENABLED=false` 对比；查看容器日志是否超时 |
 | 向量数为 0 | 确认已配置 `LLM_API_KEY` 且 `EMBEDDING_ENABLED=true`，再执行一次同步 |
 
