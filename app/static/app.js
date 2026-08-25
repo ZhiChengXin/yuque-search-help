@@ -298,14 +298,8 @@ function applyMode(mode, { clearInput = false } = {}) {
 }
 
 function filterByMode(results) {
-  if (currentMode === "all" || currentMode === "owner") return results;
-  return results.filter((item) => {
-    const path = (item.catalog_path || []).join("/");
-    const blob = `${path}/${item.doc_title || ""}`;
-    if (currentMode === "faq") return /FAQ|排查|问答|Q&A/i.test(blob);
-    if (currentMode === "manual") return /手册|指南|操作/.test(blob);
-    return true;
-  });
+  // FAQ / 手册 / 智能检索共用同一后端检索；侧栏只做引导，不再前端硬过滤漏结果
+  return results;
 }
 
 async function loadStatus() {
@@ -349,41 +343,43 @@ function renderContacts(contacts, query = "") {
     return;
   }
   box.hidden = false;
+  box.classList.add("contacts-suggest");
   box.innerHTML = contacts
-    .map(
-      (c) => `
-      <article class="contact-card">
-        <div class="top">
-          <h3>${highlight(c.module || c.menu || "模块负责人", query)}</h3>
-          <span class="badge">可联系对接</span>
-        </div>
-        <div class="path">${highlight([c.menu, c.business_line].filter(Boolean).join(" / "), query)}</div>
-        <div class="contact-grid">
-          <div>
+    .map((c, index) => {
+      const title = c.module || c.menu || "模块负责人";
+      const menu = [c.menu, c.business_line].filter(Boolean).join(" / ");
+      const testers = peopleChips(c.testers);
+      const products = peopleChips(c.product_owner);
+      const line = (c.business_line || "").trim() || "-";
+      return `
+      <article class="suggest-card owner-card contact-result-card" style="animation-delay:${index * 40}ms">
+        <span class="suggest-no">${String(index + 1).padStart(2, "0")}</span>
+        <strong>${highlight(title, query)}</strong>
+        ${menu ? `<small class="suggest-menu">${highlight(menu, query)}</small>` : ""}
+        <div class="suggest-people">
+          <div class="people-row">
             <span>测试负责人</span>
-            ${
-              peopleChips(c.testers).length
-                ? `<div class="people-row">${peopleChips(c.testers)
-                    .map((n) => `<em>${escapeHtml(n)}</em>`)
-                    .join("")}</div>`
-                : "<strong>暂未登记</strong>"
-            }
+            <div class="name-chips">${
+              testers.length
+                ? testers.map((n) => `<em>${escapeHtml(n)}</em>`).join("")
+                : "<em class=\"empty\">暂未登记</em>"
+            }</div>
           </div>
-          <div>
+          <div class="people-row">
             <span>产品负责人</span>
-            ${
-              peopleChips(c.product_owner).length
-                ? `<div class="people-row">${peopleChips(c.product_owner)
-                    .map((n) => `<em>${escapeHtml(n)}</em>`)
-                    .join("")}</div>`
-                : "<strong>暂未登记</strong>"
-            }
+            <div class="name-chips">${
+              products.length
+                ? products.map((n) => `<em>${escapeHtml(n)}</em>`).join("")
+                : "<em class=\"empty\">暂未登记</em>"
+            }</div>
           </div>
-          <div><span>产品联系方式</span><strong>${escapeHtml(c.product_contact || "暂未登记")}</strong></div>
-          <div><span>业务线</span><strong>${highlight(c.business_line || "-", query)}</strong></div>
+          <div class="people-row">
+            <span>业务线</span>
+            <div class="name-chips"><em>${highlight(line, query)}</em></div>
+          </div>
         </div>
-      </article>`
-    )
+      </article>`;
+    })
     .join("");
 }
 
@@ -438,22 +434,21 @@ function renderResults(query, payload) {
   }
 
   if (!results.length) {
-    // 智能检索等模式：只有主动问负责人时才展示联系人卡片
     renderContacts(contacts, query);
-    $("results").innerHTML = suggestFeedback
-      ? `<div class="miss-card">
-          <h3>暂时没找到对应文档</h3>
-          <p>你可以换个说法再搜，或把问题留下，我们后续补资料。</p>
-          <button type="button" class="feedback-inline-btn" id="missFeedbackBtn">提交这个问题反馈</button>
-        </div>`
-      : "";
+    const missHint = contacts.length
+      ? "可先联系下方相关模块负责人确认，或把问题留下我们补充资料。"
+      : "你可以换个说法再搜，或把问题留下，我们后续补资料。";
+    $("results").innerHTML = `
+      <div class="miss-card">
+        <h3>暂时没找到对应文档</h3>
+        <p>${missHint}</p>
+        <button type="button" class="feedback-inline-btn" id="missFeedbackBtn">提交这个问题反馈</button>
+      </div>`;
     showIntroNote(false);
     if (contacts.length) {
       setNotice("已找到可联系的人", "可直接联系对应测试/产品确认。");
-    } else if (suggestFeedback) {
-      setNotice("", "");
     } else {
-      setNotice("没有找到足够相关的内容", "可以换模块名、报错原文或更短的关键词再试。");
+      setNotice("", "");
     }
     const missBtn = $("missFeedbackBtn");
     if (missBtn) {
@@ -536,6 +531,8 @@ async function doSearch(query, { fast = false } = {}) {
   const q = (query || "").trim();
   if (!q) return;
   const isOwner = currentMode === "owner";
+  // 负责人模式永远本地匹配；文档检索默认先走快路径（字面命中秒回）
+  const useFast = isOwner || fast;
   const waitText = isOwner ? "正在匹配…" : "正在检索…";
   $("q").value = q;
   setSearchBtnLoading(true);
@@ -545,10 +542,10 @@ async function doSearch(query, { fast = false } = {}) {
   $("contacts").hidden = true;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 35000);
+  const timer = setTimeout(() => controller.abort(), isOwner ? 8000 : 35000);
   try {
     const res = await fetch(
-      `/api/search?q=${encodeURIComponent(q)}&limit=12&mode=${encodeURIComponent(currentMode)}&fast=${fast ? "1" : "0"}`,
+      `/api/search?q=${encodeURIComponent(q)}&limit=5&mode=${encodeURIComponent(currentMode)}&fast=${useFast ? "1" : "0"}`,
       { signal: controller.signal }
     );
     const data = await res.json();

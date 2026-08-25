@@ -10,6 +10,31 @@ def _soften(query: str) -> str:
     return re.sub(r"([\u4e00-\u9fff])\1+", r"\1", text)
 
 
+# 口语问句尾巴：不影响主题，去掉后便于标题命中
+_QUERY_TAIL_RE = re.compile(
+    r"(?:"
+    r"怎么办|怎么处理|怎么解决|怎么弄|怎么搞|咋办|如何是好|"
+    r"是什么原因|什么原因|啥原因|什么情况|怎么回事|咋回事|"
+    r"如何处理|如何解决|怎样处理|怎样解决|"
+    r"吗|呢|啊|呀|吧|嘛"
+    r")+[?？!！。.]*$"
+)
+
+
+def strip_query_tail(query: str) -> str:
+    """去掉「怎么办？」等口语尾巴，保留问题主体。"""
+    text = (query or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"[?？!！。.]+$", "", text).strip()
+    prev = None
+    while prev != text:
+        prev = text
+        text = _QUERY_TAIL_RE.sub("", text).strip()
+        text = re.sub(r"[?？!！。.]+$", "", text).strip()
+    return text or (query or "").strip()
+
+
 # 口语 → 补充检索词（不替换原句，只追加规范化说法）
 _REWRITE_HINTS: list[tuple[tuple[str, ...], str]] = [
     (("转圈圈", "转圈", "一直转", "转不停", "转呀转"), "加载卡住 无响应"),
@@ -31,11 +56,12 @@ _REWRITE_HINTS: list[tuple[tuple[str, ...], str]] = [
 
 
 def rewrite_query(query: str) -> str:
-    """轻量查询改写：保留原句，追加业务规范化词，提升语义召回。"""
+    """轻量查询改写：去掉口语尾巴，保留主体，并追加业务规范化词。"""
     raw = (query or "").strip()
     if not raw:
         return ""
-    soft = _soften(raw) or raw
+    core = strip_query_tail(raw) or raw
+    soft = _soften(core) or core
     extras: list[str] = []
     seen = set()
     blob = soft.lower()

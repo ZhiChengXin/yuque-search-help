@@ -7,6 +7,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def clean_heading_title(text: str) -> str:
+    """语雀常见标题清洗：去掉 **加粗**、Q/Q1：、行首圆点。"""
+    title = (text or "").strip()
+    title = re.sub(r"^\*+\s*", "", title)
+    title = re.sub(r"\s*\*+$", "", title)
+    title = title.replace("**", "")
+    title = re.sub(r"^[·•]+\s*", "", title)
+    title = re.sub(r"^Q\d*\s*[:：]\s*", "", title, flags=re.I)
+    title = re.sub(r"\s+", " ", title).strip(" ·-—|/")
+    return title
+
+
 @dataclass
 class ContactRecord:
     menu: str = ""
@@ -360,10 +372,10 @@ def split_outline_sections(
                 doc_id=doc_id,
                 slug=slug,
                 doc_title=doc_title,
-                section_title=title[:120],
+                section_title=clean_heading_title(title)[:120] or title[:120],
                 section_anchor="",
                 content=body,
-                url=make_deep_url(doc_url, title),
+                url=make_deep_url(doc_url, clean_heading_title(title) or title),
                 doc_url=doc_url,
                 catalog_path=catalog_path,
                 updated_at=updated_at,
@@ -528,6 +540,7 @@ def split_qa_from_raw(
             question = re.sub(r"\s+", " ", (match.group(1) or "").strip())
             answer = re.sub(r"\s+", " ", (match.group(2) or "").strip())
         question = re.sub(r"^[Qq][:：]\s*", "", question).strip()
+        question = clean_heading_title(question)
         answer = re.sub(r"^[Aa][:：]\s*", "", answer).strip()
         if len(question) < 4 or not answer:
             continue
@@ -654,7 +667,7 @@ def split_anchor_markdown(
     for i, match in enumerate(matches):
         level = int(match.group(1))
         anchor = match.group(2).strip()
-        title = strip_html(match.group(3))
+        title = clean_heading_title(strip_html(match.group(3)))
         if not title:
             continue
         start = match.end()
@@ -680,8 +693,40 @@ def split_anchor_markdown(
             parent_url=deep_url,
             parent_anchor=anchor,
         )
-        if qa_sections and len(qa_sections) >= 2:
+        # 章内有多条 Q/A：按问答条切；否则整章保留（含 1、2、步骤正文）
+        if qa_sections and len(qa_sections) >= 1 and (
+            len(qa_sections) >= 2 or title.lower().startswith(("q", "问题"))
+        ):
             sections.extend(qa_sections)
+            continue
+        # 大类标题（一、二、…）下的「1、具体问题」再细切；Q/A 答案里的 1、2、步骤不要拆散
+        parent_is_category = bool(
+            re.match(r"^[一二三四五六七八九十百]+[、．.]", title)
+            or re.search(r"(相关|指南|排查|概述|说明)$", title)
+        )
+        outline_parts = (
+            split_outline_sections(
+                body,
+                doc_id=doc_id,
+                slug=slug,
+                doc_title=doc_title,
+                doc_url=doc_url,
+                catalog_path=catalog_path,
+                updated_at=updated_at,
+                images=extract_images(chunk),
+                id_prefix=anchor or f"h{i}",
+                min_blocks=2,
+                min_body_len=40,
+            )
+            if parent_is_category
+            else []
+        )
+        if outline_parts and len(outline_parts) >= 2 and len(body) >= 400:
+            for part in outline_parts:
+                part.section_title = clean_heading_title(part.section_title)
+                part.url = make_deep_url(deep_url, part.section_title, anchor)
+                part.section_anchor = anchor
+            sections.extend(outline_parts)
             continue
         chunk_images = extract_images(chunk)
         sections.append(

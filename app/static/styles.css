@@ -1116,6 +1116,27 @@ body {
   font-size: 15px;
   font-weight: 800;
 }
+#contacts.contacts-suggest {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+#contacts.contacts-suggest .contact-result-card {
+  cursor: default;
+  text-align: left;
+  width: 100%;
+}
+#contacts.contacts-suggest .name-chips em.empty {
+  background: rgba(255,255,255,0.06);
+  border-color: rgba(255,255,255,0.08);
+  color: var(--muted);
+  font-weight: 600;
+}
+@media (max-width: 980px) {
+  #contacts.contacts-suggest {
+    grid-template-columns: 1fr;
+  }
+}
 
 .feedback-search-btn {
   flex: 0 0 auto;

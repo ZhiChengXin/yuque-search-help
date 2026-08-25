@@ -252,13 +252,35 @@ def make_preview(text: str, query: str, max_chars: int = 500) -> dict[str, Any]:
 
 def normalize_title(text: str) -> str:
     text = (text or "").strip().lower()
-    text = re.sub(r"^q[:：\s]+", "", text)
+    text = re.sub(r"\*+", "", text)
+    text = re.sub(r"^q\d*\s*[:：\s]+", "", text, flags=re.I)
+    # 去掉章节序号：2. / 2、 / （2） / 二、 / · 1、 等
+    text = re.sub(r"^[·•\-\*]+\s*", "", text)
+    text = re.sub(
+        r"^(?:"
+        r"\d+[.\u3001、．)\]]\s*"
+        r"|[（(]\d+[）)]\s*"
+        r"|[一二三四五六七八九十百]+[、．.]\s*"
+        r"|第[一二三四五六七八九十\d]+[章节条款]\s*"
+        r")",
+        "",
+        text,
+    )
     text = re.sub(r"\s+", "", text)
     return text
 
 
+def clean_section_title(text: str) -> str:
+    """展示用标题：与 models.clean_heading_title 对齐。"""
+    from .models import clean_heading_title
+
+    return clean_heading_title(text)
+
+
 def titles_exact_match(query: str, title: str) -> bool:
-    q = normalize_title(query)
+    from .query_rewrite import strip_query_tail
+
+    q = normalize_title(strip_query_tail(query) or query)
     t = normalize_title(title)
     if not q or not t:
         return False
@@ -267,7 +289,8 @@ def titles_exact_match(query: str, title: str) -> bool:
     # 问句与「Q：问句」互为包含且覆盖充分
     if q in t or t in q:
         shorter, longer = (q, t) if len(q) <= len(t) else (t, q)
-        return len(shorter) >= 8 and len(shorter) / max(len(longer), 1) >= 0.72
+        # 中文标题常 4～8 字；去掉序号后覆盖够高就当精确命中
+        return len(shorter) >= 4 and len(shorter) / max(len(longer), 1) >= 0.72
     return False
 
 
@@ -847,6 +870,22 @@ class SearchEngine:
                     score += 6
                 if business and (q in business or business in q):
                     score += 8
+                    match_level = "business"
+                for t in gate_query_tokens(query):
+                    if len(t) < 2:
+                        continue
+                    if business and t == business:
+                        score += 28
+                        match_level = "business"
+                    elif business and t in business:
+                        score += 14
+                        match_level = "business"
+                    elif module and t == module:
+                        score += 22
+                        match_level = "partial"
+                    elif menu and t == menu:
+                        score += 18
+                        match_level = "partial"
                 for t in q_tokens:
                     if len(t) > 1 and t in blob:
                         score += 1.5
@@ -1036,18 +1075,18 @@ class SearchEngine:
 
     @staticmethod
     def _score_to_percent(score: float, *, exact: bool, near: bool) -> float:
-        """关键词分 → 展示百分比。刻意保守：标题沾边不等于高置信。"""
+        """关键词分 → 展示百分比。标题强命中给高分；纯正文弱匹配仍保守。"""
         if exact:
             return 100.0
         if near:
-            # 标题包含/被包含：最多约 78，避免动辄 96%
-            return round(min(78.0, 50.0 + max(0.0, score) * 0.85), 1)
-        mapped = 10.0 + max(0.0, score) * 2.8
-        return round(min(66.0, mapped), 1)
+            # 标题包含/被包含：约 82～96
+            return round(min(96.0, 78.0 + max(0.0, score) * 0.35), 1)
+        mapped = 18.0 + max(0.0, score) * 3.0
+        return round(min(72.0, mapped), 1)
 
     @staticmethod
     def _normalize_match_percent(results: list[dict[str, Any]]) -> None:
-        """用向量语义校正百分比；不做「第一条人为抬分」。"""
+        """有向量时用语义微调；标题精确命中保持 100%，不强行压低字面高分。"""
         if not results:
             return
         for r in results:
@@ -1058,20 +1097,28 @@ class SearchEngine:
 
             base = float(r.get("match_percent") or 0)
             vec = float(r.get("vector_score") or 0)
+            # 标题近命中保持高分，不被「无向量压档」打穿
+            if base >= 78:
+                pct = base
+                if vec > 0:
+                    pct = max(base, min(98.0, base * 0.85 + vec * 20.0))
+                r["match_percent"] = round(min(98.0, pct), 1)
+                r["match_hint"] = f"匹配度 {r['match_percent']:.1f}%"
+                continue
+
             if vec > 0:
                 # cosine 约 0.30~0.85 → 语义分约 32~90
                 sem = min(90.0, max(0.0, (vec - 0.30) / 0.55) * 78.0 + 32.0)
                 pct = sem * 0.72 + base * 0.28
             else:
-                # 无向量信号时再压一档，避免纯字面虚高
-                pct = base * 0.82
+                pct = base
 
             if vec and vec < 0.42:
                 pct = min(pct, 78.0)
             elif not vec:
-                pct = min(pct, 74.0)
+                pct = min(pct, 86.0)
             else:
-                pct = min(pct, 90.0)
+                pct = min(pct, 92.0)
 
             r["match_percent"] = round(max(0.0, pct), 1)
             r["match_hint"] = f"匹配度 {r['match_percent']:.1f}%"

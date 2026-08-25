@@ -45,7 +45,7 @@ class LLMReranker:
     def __init__(self, api_key: str, base_url: str, model: str) -> None:
         self.api_key = (api_key or "").strip()
         self.base_url = (base_url or "https://openrouter.ai/api/v1").rstrip("/")
-        self.model = model or "qwen/qwen-2.5-72b-instruct"
+        self.model = model or "qwen/qwen3.7-plus"
 
     @property
     def enabled(self) -> bool:

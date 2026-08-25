@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     llm_api_key: str = ""
     llm_base_url: str = "https://openrouter.ai/api/v1"
-    llm_model: str = "qwen/qwen-2.5-72b-instruct"
+    llm_model: str = "qwen/qwen3.7-plus"
 
     # 本地向量召回（文件缓存在 data/embeddings，原文仍在语雀）
     embedding_enabled: bool = True
