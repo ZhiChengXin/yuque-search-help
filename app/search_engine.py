@@ -23,6 +23,8 @@ CUSTOM_WORDS = [
     "一对一群发",
     "千里眼",
     "自动回复",
+    "独立站",
+    "工单",
 ]
 
 for word in CUSTOM_WORDS:
@@ -84,6 +86,27 @@ CONTEXT_STOPWORDS = {
     "看到",
     "显示的",
     "里面的",
+    # 产品文档里极常见，用户复制 FAQ 答案时会带上，不能用来把「附件」等泛标题顶到前面
+    "修改",
+    "编辑",
+    "配置",
+    "设置",
+    "勾选",
+    "不是",
+    "可",
+    "时",
+}
+
+# 过短/过泛的章节名：不能因「查询里含有这两个字」就当成标题命中
+GENERIC_SECTION_TITLES = {
+    "附件",
+    "概述",
+    "简介",
+    "说明",
+    "功能说明",
+    "操作步骤",
+    "注意事项",
+    "常见问题",
 }
 
 
@@ -116,6 +139,32 @@ def soften_query(query: str) -> str:
     if not text:
         return ""
     return re.sub(r"([\u4e00-\u9fff])\1+", r"\1", text)
+
+
+def normalized_phrase(text: str) -> str:
+    from .query_rewrite import strip_query_tail
+
+    return re.sub(r"\s+", "", soften_query(strip_query_tail(text) or text))
+
+
+def query_phrase_in_text(query: str, text: str, *, min_len: int = 8) -> bool:
+    """查询整句（去空格）是否连续出现在正文/答案里。"""
+    q = normalized_phrase(query)
+    if len(q) < min_len:
+        return False
+    blob = normalized_phrase(text)
+    return bool(blob) and q in blob
+
+
+def _meaningful_title_overlap(query: str, title: str) -> bool:
+    """标题与查询互相包含，但排除「附件」等两字泛标题误命中。"""
+    nt = normalize_title(title)
+    nq = normalize_title(query)
+    if len(nt) < 4 or nt in GENERIC_SECTION_TITLES:
+        return False
+    if not nq:
+        return False
+    return nt in nq or nq in nt
 
 
 def base_query_tokens(query: str) -> list[str]:
@@ -275,6 +324,28 @@ def clean_section_title(text: str) -> str:
     from .models import clean_heading_title
 
     return clean_heading_title(text)
+
+
+def content_label_match(query: str, content: str) -> bool:
+    """正文行首小标题（xxx：）与查询匹配，补 HTML 大标题未单独建索引的情况。"""
+    from .query_rewrite import strip_query_tail
+
+    q = normalize_title(strip_query_tail(query) or query)
+    if len(q) < 4:
+        return False
+    for line in (content or "").split("\n"):
+        stripped = (line or "").strip()
+        if not stripped or len(stripped) > 80:
+            continue
+        if re.match(r"^.{4,42}[：:]\s*$", stripped):
+            label = normalize_title(stripped.rstrip("：: "))
+            if label == q or q in label or label in q:
+                return True
+        head = stripped.split("：", 1)[0].split(":", 1)[0].strip()
+        label = normalize_title(head)
+        if len(label) >= 4 and (label == q or q in label):
+            return True
+    return False
 
 
 def titles_exact_match(query: str, title: str) -> bool:
@@ -440,6 +511,24 @@ class SearchEngine:
         if self.sections and self._bm25 and q_tokens:
             scores = self._bm25.get_scores(q_tokens)
             ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+            # 标题精确/近似命中优先进入候选池（避免 BM25 分低被挤出 TopN）
+            title_first: list[tuple[int, float]] = []
+            seen_idx: set[int] = set()
+            for idx, sec in enumerate(self.sections):
+                if titles_exact_match(query, sec.section_title) or (
+                    soft_query != query and titles_exact_match(soft_query, sec.section_title)
+                ):
+                    title_first.append((idx, 999.0))
+                    seen_idx.add(idx)
+                elif (
+                    query_lower in (sec.section_title or "").lower()
+                    or soft_lower in (sec.section_title or "").lower()
+                    or normalize_title(query) in normalize_title(sec.section_title or "")
+                    or content_label_match(query, sec.content or "")
+                ):
+                    title_first.append((idx, 500.0))
+                    seen_idx.add(idx)
+            ranked = title_first + [(i, s) for i, s in ranked if i not in seen_idx]
             for idx, score in ranked:
                 if len(results) >= pull:
                     break
@@ -449,6 +538,11 @@ class SearchEngine:
                 content_l = sec.searchable_text.lower()
 
                 bonus = 0.0
+                answer = (sec.answer or "").strip() or extract_answer_from_content(sec.content)
+                phrase_blob = f"{sec.content or ''}\n{answer or ''}"
+                phrase_hit = query_phrase_in_text(query, phrase_blob) or (
+                    soft_query != query and query_phrase_in_text(soft_query, phrase_blob)
+                )
                 exact_section = titles_exact_match(query, sec.section_title) or (
                     soft_query != query and titles_exact_match(soft_query, sec.section_title)
                 )
@@ -457,23 +551,30 @@ class SearchEngine:
                     and (
                         query_lower in title_l
                         or soft_lower in title_l
-                        or title_l in query_lower
-                        or title_l in soft_lower
+                        or _meaningful_title_overlap(query, sec.section_title or "")
+                        or _meaningful_title_overlap(soft_query, sec.section_title or "")
                         or normalize_title(query) in normalize_title(sec.section_title)
                         or normalize_title(soft_query) in normalize_title(sec.section_title)
+                        or content_label_match(query, sec.content or "")
                     )
                 )
                 exact_doc = query_lower in doc_title_l or soft_lower in doc_title_l
+                if phrase_hit:
+                    bonus += 55.0
                 if exact_section:
                     bonus += 50.0
                 elif near_section:
                     bonus += 28.0
                 elif exact_doc:
                     bonus += 10.0
-                elif any(t in title_l for t in q_tokens if len(t) > 1):
+                elif any(
+                    t in title_l
+                    for t in q_tokens
+                    if len(t) > 1 and normalize_title(t) not in GENERIC_SECTION_TITLES
+                ):
                     bonus += 6.0
 
-                if query_lower in content_l or soft_lower in content_l:
+                if phrase_hit or query_lower in content_l or soft_lower in content_l:
                     bonus += 3.0
 
                 hit_tokens = [t for t in q_tokens if t in content_l]
@@ -499,10 +600,12 @@ class SearchEngine:
                 title = sec.section_title or ""
                 if title in ("功能说明：", "功能说明", "操作步骤", "概述", "简介") or title.endswith("基本设置"):
                     bonus -= 6.0
+                if normalize_title(title) in GENERIC_SECTION_TITLES and not phrase_hit:
+                    bonus -= 12.0
 
                 final_score = float(score) + bonus
-                # 精确标题永远保留；弱匹配过滤（阈值放宽，让长口语问法先进候选池）
-                if exact_section or near_section:
+                # 精确标题 / 正文整句连续命中永远保留
+                if exact_section or near_section or phrase_hit:
                     pass
                 elif final_score < 1.0 or gate_coverage < 0.28:
                     meaningful = [t for t in gate_hits if len(t) >= 2]
@@ -516,14 +619,15 @@ class SearchEngine:
                         continue
 
                 snippet_source = sec.content or sec.section_title
-                answer = (sec.answer or "").strip() or extract_answer_from_content(sec.content)
                 if answer and sec.kind == "qa":
                     preview = {"text": f"A：{answer}", "truncated": False}
                 else:
                     preview = make_preview(snippet_source, query, max_chars=500)
                 images = list(sec.images or [])[:2]
                 match_percent = self._score_to_percent(
-                    final_score, exact=exact_section, near=near_section
+                    final_score,
+                    exact=exact_section,
+                    near=near_section or phrase_hit,
                 )
                 results.append(
                     {
@@ -546,6 +650,7 @@ class SearchEngine:
                         "has_anchor": bool(sec.section_anchor) or sec.kind == "qa",
                         "kind": sec.kind,
                         "exact_title": exact_section,
+                        "phrase_hit": phrase_hit,
                     }
                 )
 
@@ -575,6 +680,10 @@ class SearchEngine:
                     hit_ratio = (
                         sum(1 for t in meaningful_q if t in top_blob) / max(len(meaningful_q), 1)
                     )
+                    top_phrase = bool(top.get("phrase_hit")) or query_phrase_in_text(
+                        query,
+                        f"{top.get('snippet') or ''}\n{top.get('answer') or ''}",
+                    )
                     # 长词（>=4）若整份候选前几名都没有，才从候选里剔除「完全不含该词」的项
                     rare_terms = [
                         t
@@ -588,10 +697,15 @@ class SearchEngine:
                             results = []
                     elif not strong and top.get("score", 0) < 5 and hit_ratio < 0.35:
                         results = []
-                    else:
-                        # 顶名偏了但不至于全空：把覆盖更好的结果往前挪
+                    elif not top_phrase:
+                        # 顶名偏了但不至于全空：正文整句命中优先，再按实质词覆盖排序
                         results.sort(
                             key=lambda r: (
+                                1 if r.get("phrase_hit") else 0,
+                                query_phrase_in_text(
+                                    query,
+                                    f"{r.get('snippet') or ''}\n{r.get('answer') or ''}",
+                                ),
                                 sum(1 for t in meaningful_q if t in _blob(r)),
                                 float(r.get("score") or 0),
                             ),

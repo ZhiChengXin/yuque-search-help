@@ -36,7 +36,9 @@ class Settings(BaseSettings):
 
     host: str = "0.0.0.0"
     port: int = 8787
-    sync_interval_seconds: int = 600
+    # 定时同步：优先 SYNC_DAILY_AT（本地时区 HH:MM，如 00:00）；为空则退回间隔秒数
+    sync_daily_at: str = "00:00"
+    sync_interval_seconds: int = 86400
     app_title: str = "孚盟MX 智能检索助手"
 
 

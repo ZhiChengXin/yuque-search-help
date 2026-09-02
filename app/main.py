@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,21 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 _webhook_sync_task: asyncio.Task | None = None
+
+
+def seconds_until_daily_at(hhmm: str) -> float:
+    """距下一次本地 HH:MM 的秒数（用于每天定时同步）。"""
+    text = (hhmm or "").strip()
+    if not text:
+        raise ValueError("empty sync_daily_at")
+    parts = text.split(":")
+    hour = int(parts[0])
+    minute = int(parts[1]) if len(parts) > 1 else 0
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(1.0, (target - now).total_seconds())
 
 
 class SearchRequest(BaseModel):
@@ -79,8 +95,22 @@ async def lifespan(app: FastAPI):
 
     async def periodic_sync():
         while True:
-            await asyncio.sleep(settings.sync_interval_seconds)
-            await index.async_sync()
+            daily_at = (settings.sync_daily_at or "").strip()
+            if daily_at:
+                delay = seconds_until_daily_at(daily_at)
+                next_at = datetime.now() + timedelta(seconds=delay)
+                logger.info(
+                    "下次定时同步 %s（约 %.1f 小时后，本地时间）",
+                    next_at.strftime("%Y-%m-%d %H:%M"),
+                    delay / 3600.0,
+                )
+                await asyncio.sleep(delay)
+            else:
+                await asyncio.sleep(max(60, settings.sync_interval_seconds))
+            logger.info("开始定时同步")
+            result = await index.async_sync()
+            if not result.get("ok"):
+                logger.error("定时同步失败: %s", result.get("message"))
 
     boot_task = asyncio.create_task(bootstrap())
     sync_task = asyncio.create_task(periodic_sync())
@@ -117,6 +147,7 @@ async def status():
         **index.status(),
         "app_title": settings.app_title,
         "sync_interval_seconds": settings.sync_interval_seconds,
+        "sync_daily_at": settings.sync_daily_at,
     }
 
 

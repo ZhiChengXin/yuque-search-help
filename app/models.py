@@ -329,6 +329,142 @@ def split_problem_faq_sections(
     return sections
 
 
+def split_label_sections(
+    text: str,
+    *,
+    doc_id: str,
+    slug: str,
+    doc_title: str,
+    doc_url: str,
+    catalog_path: list[str],
+    updated_at: str = "",
+    images: list[str] | None = None,
+    id_prefix: str = "lb",
+    min_blocks: int = 1,
+) -> list[DocSection]:
+    """手册前言/正文里「模块权限分配：」「账号类型和使用场景介绍：」等小标题块。"""
+    source = (text or "").strip()
+    if not source:
+        return []
+    lines = source.split("\n")
+    markers: list[tuple[int, str, str]] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^.{4,42}[：:]\s*$", stripped):
+            title = stripped.rstrip("：: ").strip()
+            markers.append((i, title, ""))
+            continue
+        m = re.match(r"^(.{2,28}[：:])\s*(.+)$", stripped)
+        if m:
+            title = m.group(1).rstrip("：: ").strip()
+            if 2 <= len(title) <= 28 and not re.match(r"^\d", title):
+                markers.append((i, title, m.group(2).strip()))
+    if len(markers) < min_blocks:
+        return []
+    sections: list[DocSection] = []
+    shared_images = list(images or [])
+    for idx, (line_no, title, inline) in enumerate(markers):
+        next_line = markers[idx + 1][0] if idx + 1 < len(markers) else len(lines)
+        body_lines: list[str] = []
+        if inline:
+            body_lines.append(inline)
+        body_lines.extend(lines[line_no + 1 : next_line])
+        body = "\n".join(x.strip() for x in body_lines if x.strip()).strip()
+        content = f"{title}：\n{body}".strip() if body else title
+        if len(content) < 6:
+            continue
+        sections.append(
+            DocSection(
+                id=f"{doc_id}:{id_prefix}-{idx + 1}",
+                doc_id=doc_id,
+                slug=slug,
+                doc_title=doc_title,
+                section_title=title,
+                section_anchor="",
+                content=content,
+                url=make_deep_url(doc_url, title),
+                doc_url=doc_url,
+                catalog_path=catalog_path,
+                updated_at=updated_at,
+                kind="section",
+                images=shared_images if (idx == 0 or len(shared_images) <= 2) else [],
+                level=0,
+            )
+        )
+    return sections
+
+
+def _attach_parent_to_parts(
+    parts: list[DocSection],
+    *,
+    parent_url: str,
+    parent_anchor: str,
+) -> list[DocSection]:
+    for part in parts:
+        part.section_title = clean_heading_title(part.section_title)
+        part.url = make_deep_url(parent_url, part.section_title, parent_anchor)
+        part.section_anchor = parent_anchor
+    return parts
+
+
+def split_subsections(
+    body: str,
+    *,
+    doc_id: str,
+    slug: str,
+    doc_title: str,
+    doc_url: str,
+    catalog_path: list[str],
+    updated_at: str = "",
+    images: list[str] | None = None,
+    id_prefix: str = "sub",
+    parent_url: str = "",
+    parent_anchor: str = "",
+    min_label_blocks: int = 1,
+    min_outline_blocks: int = 1,
+) -> list[DocSection]:
+    """章内再切：小标题(xxx：) → 大纲(1、/一、)，大标题与小标题都应可检索。"""
+    source = (body or "").strip()
+    if len(source) < 12:
+        return []
+    label_parts = split_label_sections(
+        source,
+        doc_id=doc_id,
+        slug=slug,
+        doc_title=doc_title,
+        doc_url=doc_url,
+        catalog_path=catalog_path,
+        updated_at=updated_at,
+        images=images,
+        id_prefix=id_prefix,
+        min_blocks=min_label_blocks,
+    )
+    if len(label_parts) >= min_label_blocks:
+        return _attach_parent_to_parts(
+            label_parts, parent_url=parent_url or doc_url, parent_anchor=parent_anchor
+        )
+    outline_parts = split_outline_sections(
+        source,
+        doc_id=doc_id,
+        slug=slug,
+        doc_title=doc_title,
+        doc_url=doc_url,
+        catalog_path=catalog_path,
+        updated_at=updated_at,
+        images=images,
+        id_prefix=id_prefix,
+        min_blocks=min_outline_blocks,
+        min_body_len=24,
+    )
+    if len(outline_parts) >= min_outline_blocks:
+        return _attach_parent_to_parts(
+            outline_parts, parent_url=parent_url or doc_url, parent_anchor=parent_anchor
+        )
+    return []
+
+
 def split_outline_sections(
     text: str,
     *,
@@ -411,23 +547,33 @@ def _split_plain_document(
         return qa_sections
     body = markdown_or_html_to_text(raw)
     images = extract_images(raw)
-    for splitter, prefix in (
-        (split_problem_faq_sections, "pf"),
-        (split_outline_sections, "ol"),
-    ):
-        parts = splitter(
-            body,
-            doc_id=doc_id,
-            slug=slug,
-            doc_title=doc_title,
-            doc_url=doc_url,
-            catalog_path=catalog_path,
-            updated_at=updated_at,
-            images=images,
-            id_prefix=prefix,
-        )
-        if parts:
-            return parts
+    problem_parts = split_problem_faq_sections(
+        body,
+        doc_id=doc_id,
+        slug=slug,
+        doc_title=doc_title,
+        doc_url=doc_url,
+        catalog_path=catalog_path,
+        updated_at=updated_at,
+        images=images,
+        id_prefix="pf",
+    )
+    if problem_parts:
+        return problem_parts
+    parts = split_subsections(
+        body,
+        doc_id=doc_id,
+        slug=slug,
+        doc_title=doc_title,
+        doc_url=doc_url,
+        catalog_path=catalog_path,
+        updated_at=updated_at,
+        images=images,
+        id_prefix="root",
+        parent_url=doc_url,
+    )
+    if parts:
+        return parts
     if not body.strip():
         return []
     return [
@@ -464,12 +610,11 @@ def split_qa_from_raw(
     parent_anchor: str = "",
 ) -> list[DocSection]:
     """从原始 HTML/Markdown 按 Q/A 切分，并给每条挂上块内图片。"""
-    chunks = _qa_raw_chunks(raw)
-    if not chunks:
-        chunks = _numbered_qa_raw_chunks(raw)
-    if not chunks:
-        text = markdown_or_html_to_text(raw)
-        sections = split_qa_sections(
+    shared_images = extract_images(raw)
+    text = markdown_or_html_to_text(raw)
+
+    def _text_sections() -> list[DocSection]:
+        parts = split_qa_sections(
             text,
             doc_id=doc_id,
             slug=slug,
@@ -477,14 +622,14 @@ def split_qa_from_raw(
             doc_url=doc_url,
             catalog_path=catalog_path,
             updated_at=updated_at,
-            images=extract_images(raw),
+            images=shared_images,
             id_prefix=id_prefix,
             parent_title=parent_title,
             parent_url=parent_url,
             parent_anchor=parent_anchor,
         )
-        if sections:
-            return sections
+        if parts:
+            return parts
         return split_numbered_qa_sections(
             text,
             doc_id=doc_id,
@@ -493,12 +638,18 @@ def split_qa_from_raw(
             doc_url=doc_url,
             catalog_path=catalog_path,
             updated_at=updated_at,
-            images=extract_images(raw),
+            images=shared_images,
             id_prefix=id_prefix,
             parent_title=parent_title,
             parent_url=parent_url,
             parent_anchor=parent_anchor,
         )
+
+    chunks = _qa_raw_chunks(raw)
+    if not chunks:
+        chunks = _numbered_qa_raw_chunks(raw)
+    if not chunks:
+        return _text_sections()
 
     sections: list[DocSection] = []
     for idx, chunk in enumerate(chunks):
@@ -565,7 +716,11 @@ def split_qa_from_raw(
                 answer=answer,
             )
         )
-    return sections
+    text_sections = _text_sections()
+    # HTML 按 Q 切块常漏掉大量 Q/A（语雀 发现模块 等）；纯文本切分更全
+    if text_sections and len(text_sections) > len(sections):
+        return text_sections
+    return sections if sections else text_sections
 
 
 def strip_html(text: str) -> str:
@@ -645,24 +800,40 @@ def split_anchor_markdown(
         )
         if preface_qa:
             sections.extend(preface_qa)
-        elif len(preface) >= 120 or extract_images(preface_raw):
-            sections.append(
-                DocSection(
-                    id=f"{doc_id}:preface",
-                    doc_id=doc_id,
-                    slug=slug,
-                    doc_title=doc_title,
-                    section_title=doc_title,
-                    section_anchor="",
-                    content=preface,
-                    url=doc_url,
-                    doc_url=doc_url,
-                    catalog_path=catalog_path,
-                    updated_at=updated_at,
-                    kind="doc",
-                    images=extract_images(preface_raw),
-                )
+        else:
+            preface_images = extract_images(preface_raw)
+            preface_parts = split_subsections(
+                preface,
+                doc_id=doc_id,
+                slug=slug,
+                doc_title=doc_title,
+                doc_url=doc_url,
+                catalog_path=catalog_path,
+                updated_at=updated_at,
+                images=preface_images,
+                id_prefix="preface",
+                parent_url=doc_url,
             )
+            if preface_parts:
+                sections.extend(preface_parts)
+            elif len(preface) >= 120 or preface_images:
+                sections.append(
+                    DocSection(
+                        id=f"{doc_id}:preface",
+                        doc_id=doc_id,
+                        slug=slug,
+                        doc_title=doc_title,
+                        section_title=doc_title,
+                        section_anchor="",
+                        content=preface,
+                        url=doc_url,
+                        doc_url=doc_url,
+                        catalog_path=catalog_path,
+                        updated_at=updated_at,
+                        kind="doc",
+                        images=preface_images,
+                    )
+                )
 
     for i, match in enumerate(matches):
         level = int(match.group(1))
@@ -699,36 +870,45 @@ def split_anchor_markdown(
         ):
             sections.extend(qa_sections)
             continue
-        # 大类标题（一、二、…）下的「1、具体问题」再细切；Q/A 答案里的 1、2、步骤不要拆散
-        parent_is_category = bool(
-            re.match(r"^[一二三四五六七八九十百]+[、．.]", title)
-            or re.search(r"(相关|指南|排查|概述|说明)$", title)
-        )
-        outline_parts = (
-            split_outline_sections(
-                body,
-                doc_id=doc_id,
-                slug=slug,
-                doc_title=doc_title,
-                doc_url=doc_url,
-                catalog_path=catalog_path,
-                updated_at=updated_at,
-                images=extract_images(chunk),
-                id_prefix=anchor or f"h{i}",
-                min_blocks=2,
-                min_body_len=40,
-            )
-            if parent_is_category
-            else []
-        )
-        if outline_parts and len(outline_parts) >= 2 and len(body) >= 400:
-            for part in outline_parts:
-                part.section_title = clean_heading_title(part.section_title)
-                part.url = make_deep_url(deep_url, part.section_title, anchor)
-                part.section_anchor = anchor
-            sections.extend(outline_parts)
-            continue
         chunk_images = extract_images(chunk)
+        sub_parts = split_subsections(
+            body,
+            doc_id=doc_id,
+            slug=slug,
+            doc_title=doc_title,
+            doc_url=doc_url,
+            catalog_path=catalog_path,
+            updated_at=updated_at,
+            images=chunk_images,
+            id_prefix=anchor or f"h{i}",
+            parent_url=deep_url,
+            parent_anchor=anchor,
+            min_outline_blocks=2 if len(body) >= 400 else 1,
+        )
+        if sub_parts:
+            for part in sub_parts:
+                part.level = level
+            sections.extend(sub_parts)
+            # 大标题也单独保留一条，避免拆子节后「一、账号管理」类标题搜不到
+            sections.append(
+                DocSection(
+                    id=f"{doc_id}:{anchor}",
+                    doc_id=doc_id,
+                    slug=slug,
+                    doc_title=doc_title,
+                    section_title=title,
+                    section_anchor=anchor,
+                    content=body[:800] if len(body) > 800 else body,
+                    url=deep_url,
+                    doc_url=doc_url,
+                    catalog_path=catalog_path,
+                    updated_at=updated_at,
+                    kind="section",
+                    images=chunk_images,
+                    level=level,
+                )
+            )
+            continue
         sections.append(
             DocSection(
                 id=f"{doc_id}:{anchor}",

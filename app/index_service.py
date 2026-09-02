@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from .config import Settings
+from .doc_structure import summarize_audits
 from .embeddings import EmbeddingClient, LocalVectorIndex
 from .llm import LLMReranker
 from .query_rewrite import rewrite_query, strip_query_tail
@@ -58,6 +59,7 @@ class KnowledgeIndex:
         self.doc_count = 0
         self.section_count = 0
         self.contact_count = 0
+        self.last_split_audit: dict[str, Any] = {}
 
     def _build_client(self) -> YuqueClient:
         return YuqueClient(
@@ -80,8 +82,10 @@ class KnowledgeIndex:
         try:
             logger.info("开始同步语雀知识库…")
             client.login()
-            sections, contacts = client.fetch_all()
+            sections, contacts, doc_audits = client.fetch_all()
             docs = {s.doc_id for s in sections}
+            audit_summary = summarize_audits(doc_audits)
+            self.last_split_audit = audit_summary
             with self._lock:
                 self.engine.rebuild(sections, contacts)
                 self.doc_count = len(docs)
@@ -106,6 +110,11 @@ class KnowledgeIndex:
                 self.contact_count,
                 self.vector_count,
             )
+            if audit_summary.get("flagged_count"):
+                logger.warning(
+                    "同步自检：%s 篇文档切分需关注，详见 split_audit.flagged",
+                    audit_summary["flagged_count"],
+                )
             return {
                 "ok": True,
                 "doc_count": self.doc_count,
@@ -114,6 +123,7 @@ class KnowledgeIndex:
                 "vector_count": self.vector_count,
                 "vector_embedded": vector_stats.get("embedded", 0),
                 "vector_reused": vector_stats.get("reused", 0),
+                "split_audit": audit_summary,
             }
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
@@ -178,6 +188,17 @@ class KnowledgeIndex:
             lexical["confidence"] = "high"
             return lexical
 
+        lexical_results = lexical.get("results") or []
+        # 关键词无召回，或 Top 明显跑题：秒回「未找到」，不再等向量/大模型
+        if (
+            not lexical_results
+            or self._lexical_is_weak_miss(original_query, lexical_results)
+            or self._lexical_is_weak_miss(core_query, lexical_results)
+        ):
+            miss = self._miss_payload(original_query, lexical)
+            miss["llm_used"] = False
+            return miss
+
         use_llm = self.llm.enabled and not fast
         expanded: list[str] = []
         first_queries = [primary_query]
@@ -196,19 +217,6 @@ class KnowledgeIndex:
             use_llm=use_llm,
             retrieve_limit=40 if use_llm else max(limit, 16),
         )
-        if use_llm and not (payload.get("results") or []) and expanded:
-            retry = self._search_with_queries(
-                original_query,
-                first_queries,
-                limit=display_limit,
-                mode=search_mode,
-                use_llm=use_llm,
-                retrieve_limit=56,
-                second_pass=True,
-                rerank_min_score=48,
-            )
-            if retry.get("results"):
-                return retry
         return payload
 
     def _owner_payload(self, query: str, *, limit: int = 8) -> dict[str, Any]:
@@ -291,6 +299,53 @@ class KnowledgeIndex:
             nt = soften_query(title).lower()
             if len(nt) >= 4 and (nt in q or q in nt):
                 return True
+        return False
+
+    @staticmethod
+    def _lexical_is_weak_miss(query: str, results: list[dict[str, Any]]) -> bool:
+        """字面召回跑题/过弱：不必再耗外网向量和大模型。"""
+        if not results:
+            return True
+        head = results[:5]
+        if any(r.get("exact_title") or r.get("phrase_hit") for r in head):
+            return False
+
+        core = [t for t in gate_query_tokens(query) if len(t) >= 2]
+        if not core:
+            return True
+        distinctive = [t for t in core if len(t) >= 3] or core
+
+        def _blob(item: dict[str, Any]) -> str:
+            return soften_query(
+                " ".join(
+                    [
+                        str(item.get("title") or ""),
+                        str(item.get("doc_title") or ""),
+                        str(item.get("preview") or ""),
+                        str(item.get("snippet") or ""),
+                        str(item.get("answer") or ""),
+                        " ".join(item.get("catalog_path") or []),
+                    ]
+                ).lower()
+            )
+
+        blobs = [_blob(r) for r in head]
+        d_hits = sum(1 for t in distinctive if any(t in b for b in blobs))
+        # 关键业务词几乎都对不上 → 当未命中
+        if len(distinctive) >= 2 and d_hits < max(1, (len(distinctive) + 1) // 2):
+            return True
+        if len(distinctive) == 1 and d_hits < 1:
+            return True
+        if not _results_cover_query(query, head):
+            return True
+        try:
+            top = results[0]
+            pct = float(top.get("match_percent") or 0)
+            score = float(top.get("score") or 0)
+        except (TypeError, ValueError):
+            pct, score = 0.0, 0.0
+        if not _title_catalog_cover(query, top) and (pct < 78 or score < 18):
+            return True
         return False
 
     def _search_with_queries(
@@ -519,6 +574,7 @@ class KnowledgeIndex:
                 "vector_enabled": self.vector_index is not None and self.vector_index.enabled,
                 "last_synced_at": self.last_synced_at,
                 "last_error": self.last_error,
+                "split_audit": self.last_split_audit,
                 "book": f"{self.settings.yuque_login}/{self.settings.yuque_repo}",
                 "book_url": (
                     f"{self.settings.yuque_host}/"

@@ -527,6 +527,21 @@ function openFeedbackWithQuery(query) {
   openFeedback({ seedText: seed });
 }
 
+const MISS_SEARCH_ADVICE =
+  "这边暂时没翻到能直接对上的资料，可能相关文档还没同步进来。" +
+  "你可以换个关键词再试试，或点「我要反馈」把问题留下，我们后续补上。";
+
+/** 与「未找到文档」同一套页面：顶部提示 + 文档命中 0 + 反馈卡片 */
+function renderMissResults(query, { advice = MISS_SEARCH_ADVICE, contacts = [] } = {}) {
+  renderResults(query, {
+    results: [],
+    contacts,
+    confidence: "none",
+    advice,
+    suggest_feedback: true,
+  });
+}
+
 async function doSearch(query, { fast = false } = {}) {
   const q = (query || "").trim();
   if (!q) return;
@@ -560,16 +575,13 @@ async function doSearch(query, { fast = false } = {}) {
     renderResults(q, data);
   } catch (err) {
     const aborted = err && (err.name === "AbortError" || err.code === 20);
-    $("adviceBox").hidden = false;
-    $("adviceBox").className = "advice none";
-    $("adviceBox").textContent = aborted
-      ? "检索超时了，请再试一次或换个关键词"
-      : "搜索请求失败，请确认服务已启动";
-    $("results").innerHTML = "";
-    setNotice(
-      aborted ? "检索超时" : "搜索请求失败",
-      aborted ? "可以缩短问题再搜，或稍后重试。" : "请确认服务已启动后重试"
-    );
+    if (aborted) {
+      renderMissResults(q);
+    } else {
+      renderMissResults(q, {
+        advice: "搜索请求失败，请确认服务已启动后再试，或点「我要反馈」把问题留下。",
+      });
+    }
   } finally {
     clearTimeout(timer);
     setSearchBtnLoading(false);

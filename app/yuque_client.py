@@ -12,12 +12,12 @@ import httpx
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
+from .doc_structure import DocumentAudit, split_document, summarize_audits
 from .models import (
     ContactRecord,
     DocSection,
     contacts_to_sections,
     parse_lakesheet_contacts,
-    split_anchor_markdown,
 )
 
 logger = logging.getLogger("yuque-help-search")
@@ -237,14 +237,17 @@ class YuqueClient:
             params={"book_id": self.book_id, "raw": "1"},
         )
 
-    def fetch_all(self, concurrency: int = 4) -> tuple[list[DocSection], list[ContactRecord]]:
+    def fetch_all(
+        self, concurrency: int = 4
+    ) -> tuple[list[DocSection], list[ContactRecord], list[DocumentAudit]]:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         docs = self.list_docs()
         sections: list[DocSection] = []
         contacts: list[ContactRecord] = []
+        audits: list[DocumentAudit] = []
 
-        def load_one(doc: dict[str, Any]) -> tuple[list[DocSection], list[ContactRecord]]:
+        def load_one(doc: dict[str, Any]) -> tuple[list[DocSection], list[ContactRecord], DocumentAudit | None]:
             slug = doc.get("slug") or ""
             doc_id = str(doc.get("id") or slug)
             title = (doc.get("title") or "未命名文档").strip()
@@ -264,12 +267,12 @@ class YuqueClient:
                     doc_title=title,
                     doc_url=doc_url,
                 )
-                return contact_sections, parsed
+                return contact_sections, parsed, None
 
             raw = self.fetch_anchor_markdown(slug)
             if not raw:
                 raw = detail.get("body_html") or detail.get("body") or ""
-            split = split_anchor_markdown(
+            split, audit = split_document(
                 raw,
                 doc_id=doc_id,
                 slug=slug,
@@ -278,17 +281,19 @@ class YuqueClient:
                 catalog_path=catalog_path,
                 updated_at=updated_at,
             )
-            return split, []
+            return split, [], audit
 
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = [pool.submit(load_one, d) for d in docs]
             for fut in as_completed(futures):
-                secs, cons = fut.result()
+                secs, cons, audit = fut.result()
                 sections.extend(secs)
                 contacts.extend(cons)
+                if audit is not None:
+                    audits.append(audit)
 
         sections.sort(key=lambda x: (x.doc_title, x.section_title))
-        return sections, contacts
+        return sections, contacts, audits
 
     def get_doc(self, namespace: str, slug: str) -> dict[str, Any]:
         return self._get_json(f"api/v2/repos/{namespace}/docs/{slug}", params={"raw": "1"})
