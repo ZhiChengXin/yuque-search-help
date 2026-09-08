@@ -326,6 +326,13 @@ def clean_section_title(text: str) -> str:
     return clean_heading_title(text)
 
 
+def effective_section_title(sec: DocSection) -> str:
+    """检索/展示用标题：问候语起句回退到文档题。"""
+    from .models import display_section_title
+
+    return display_section_title(sec.section_title, sec.doc_title)
+
+
 def content_label_match(query: str, content: str) -> bool:
     """正文行首小标题（xxx：）与查询匹配，补 HTML 大标题未单独建索引的情况。"""
     from .query_rewrite import strip_query_tail
@@ -339,10 +346,18 @@ def content_label_match(query: str, content: str) -> bool:
             continue
         if re.match(r"^.{4,42}[：:]\s*$", stripped):
             label = normalize_title(stripped.rstrip("：: "))
+            from .models import is_greeting_or_answer_label
+
+            if is_greeting_or_answer_label(label):
+                continue
             if label == q or q in label or label in q:
                 return True
         head = stripped.split("：", 1)[0].split(":", 1)[0].strip()
         label = normalize_title(head)
+        from .models import is_greeting_or_answer_label
+
+        if is_greeting_or_answer_label(label):
+            continue
         if len(label) >= 4 and (label == q or q in label):
             return True
     return False
@@ -515,15 +530,23 @@ class SearchEngine:
             title_first: list[tuple[int, float]] = []
             seen_idx: set[int] = set()
             for idx, sec in enumerate(self.sections):
-                if titles_exact_match(query, sec.section_title) or (
-                    soft_query != query and titles_exact_match(soft_query, sec.section_title)
+                eff_title = effective_section_title(sec)
+                if titles_exact_match(query, eff_title) or titles_exact_match(query, sec.doc_title) or (
+                    soft_query != query
+                    and (
+                        titles_exact_match(soft_query, eff_title)
+                        or titles_exact_match(soft_query, sec.doc_title)
+                    )
                 ):
                     title_first.append((idx, 999.0))
                     seen_idx.add(idx)
                 elif (
-                    query_lower in (sec.section_title or "").lower()
-                    or soft_lower in (sec.section_title or "").lower()
-                    or normalize_title(query) in normalize_title(sec.section_title or "")
+                    query_lower in (eff_title or "").lower()
+                    or soft_lower in (eff_title or "").lower()
+                    or query_lower in (sec.doc_title or "").lower()
+                    or soft_lower in (sec.doc_title or "").lower()
+                    or normalize_title(query) in normalize_title(eff_title or "")
+                    or normalize_title(query) in normalize_title(sec.doc_title or "")
                     or content_label_match(query, sec.content or "")
                 ):
                     title_first.append((idx, 500.0))
@@ -533,7 +556,8 @@ class SearchEngine:
                 if len(results) >= pull:
                     break
                 sec = self.sections[idx]
-                title_l = sec.section_title.lower()
+                eff_title = effective_section_title(sec)
+                title_l = (eff_title or "").lower()
                 doc_title_l = sec.doc_title.lower()
                 content_l = sec.searchable_text.lower()
 
@@ -543,18 +567,28 @@ class SearchEngine:
                 phrase_hit = query_phrase_in_text(query, phrase_blob) or (
                     soft_query != query and query_phrase_in_text(soft_query, phrase_blob)
                 )
-                exact_section = titles_exact_match(query, sec.section_title) or (
-                    soft_query != query and titles_exact_match(soft_query, sec.section_title)
+                exact_section = (
+                    titles_exact_match(query, eff_title)
+                    or titles_exact_match(query, sec.doc_title)
+                    or (
+                        soft_query != query
+                        and (
+                            titles_exact_match(soft_query, eff_title)
+                            or titles_exact_match(soft_query, sec.doc_title)
+                        )
+                    )
                 )
                 near_section = (
                     not exact_section
                     and (
                         query_lower in title_l
                         or soft_lower in title_l
-                        or _meaningful_title_overlap(query, sec.section_title or "")
-                        or _meaningful_title_overlap(soft_query, sec.section_title or "")
-                        or normalize_title(query) in normalize_title(sec.section_title)
-                        or normalize_title(soft_query) in normalize_title(sec.section_title)
+                        or query_lower in doc_title_l
+                        or soft_lower in doc_title_l
+                        or _meaningful_title_overlap(query, eff_title or "")
+                        or _meaningful_title_overlap(soft_query, eff_title or "")
+                        or normalize_title(query) in normalize_title(eff_title)
+                        or normalize_title(soft_query) in normalize_title(eff_title)
                         or content_label_match(query, sec.content or "")
                     )
                 )
@@ -597,7 +631,7 @@ class SearchEngine:
                 if content_len < 24 and (exact_section or near_section):
                     bonus -= 18.0
                 # 过宽的目录型标题略降权，优先具体操作章节
-                title = sec.section_title or ""
+                title = eff_title or ""
                 if title in ("功能说明：", "功能说明", "操作步骤", "概述", "简介") or title.endswith("基本设置"):
                     bonus -= 6.0
                 if normalize_title(title) in GENERIC_SECTION_TITLES and not phrase_hit:
@@ -618,7 +652,7 @@ class SearchEngine:
                     ):
                         continue
 
-                snippet_source = sec.content or sec.section_title
+                snippet_source = sec.content or eff_title
                 if answer and sec.kind == "qa":
                     preview = {"text": f"A：{answer}", "truncated": False}
                 else:
@@ -632,9 +666,9 @@ class SearchEngine:
                 results.append(
                     {
                         "id": sec.id,
-                        "title": sec.section_title,
+                        "title": eff_title,
                         "doc_title": sec.doc_title,
-                        "url": make_deep_url(sec.doc_url, sec.section_title, sec.section_anchor),
+                        "url": make_deep_url(sec.doc_url, eff_title, sec.section_anchor),
                         "doc_url": sec.doc_url,
                         "snippet": preview["text"],
                         "preview": preview["text"],
@@ -916,17 +950,18 @@ class SearchEngine:
         near: bool,
     ) -> dict[str, Any]:
         answer = (sec.answer or "").strip() or extract_answer_from_content(sec.content)
+        show_title = effective_section_title(sec)
         if answer and sec.kind == "qa":
             preview = {"text": f"A：{answer}", "truncated": False}
         else:
-            preview = make_preview(sec.content or sec.section_title, query, max_chars=500)
+            preview = make_preview(sec.content or show_title, query, max_chars=500)
         images = list(sec.images or [])[:2]
         match_percent = self._score_to_percent(score, exact=exact, near=near)
         return {
             "id": sec.id,
-            "title": sec.section_title,
+            "title": show_title,
             "doc_title": sec.doc_title,
-            "url": make_deep_url(sec.doc_url, sec.section_title, sec.section_anchor),
+            "url": make_deep_url(sec.doc_url, show_title, sec.section_anchor),
             "doc_url": sec.doc_url,
             "snippet": preview["text"],
             "preview": preview["text"],

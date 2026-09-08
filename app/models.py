@@ -19,6 +19,41 @@ def clean_heading_title(text: str) -> str:
     return title
 
 
+# 客服口吻/答案起句：常被「xxx：」规则误切成章节标题
+_GREETING_LABEL_RE = re.compile(
+    r"^(您好|你好|亲[，,：:]?|哈喽|hello)\b",
+    re.IGNORECASE,
+)
+_ANSWER_OPENER_RE = re.compile(
+    r"^(可以在|可以点击|可以|请登录|请在|请先|请到|建议|已为|如下|如下图|"
+    r"操作如下|按如下|点击|打开|进入)"
+)
+
+
+def is_greeting_or_answer_label(title: str) -> bool:
+    """是否像客服开场白/答案起句，而不是真正的小标题。"""
+    t = clean_heading_title(title)
+    if not t:
+        return True
+    if _GREETING_LABEL_RE.match(t):
+        return True
+    if _ANSWER_OPENER_RE.match(t):
+        return True
+    # 「您好: 可以在」这类截断句
+    if "您好" in t[:4] or "你好" in t[:4]:
+        return True
+    return False
+
+
+def display_section_title(section_title: str, doc_title: str) -> str:
+    """搜索结果展示标题：问候语/答案起句回退到文档题。"""
+    st = clean_heading_title(section_title)
+    dt = clean_heading_title(doc_title) or (doc_title or "").strip()
+    if not st or is_greeting_or_answer_label(st):
+        return dt or st
+    return st
+
+
 @dataclass
 class ContactRecord:
     menu: str = ""
@@ -354,14 +389,21 @@ def split_label_sections(
             continue
         if re.match(r"^.{4,42}[：:]\s*$", stripped):
             title = stripped.rstrip("：: ").strip()
+            if is_greeting_or_answer_label(title):
+                continue
             markers.append((i, title, ""))
             continue
         m = re.match(r"^(.{2,28}[：:])\s*(.+)$", stripped)
         if m:
             title = m.group(1).rstrip("：: ").strip()
+            if is_greeting_or_answer_label(title):
+                continue
             if 2 <= len(title) <= 28 and not re.match(r"^\d", title):
                 markers.append((i, title, m.group(2).strip()))
     if len(markers) < min_blocks:
+        return []
+    # 全是客服口吻时视为无效切分，交给上层整篇回退
+    if markers and all(is_greeting_or_answer_label(t) for _, t, _ in markers):
         return []
     sections: list[DocSection] = []
     shared_images = list(images or [])
