@@ -130,6 +130,21 @@ function highlight(text, query) {
   }
 }
 
+/** 查询已对上标题时，正文不再重复提亮同一关键词 */
+function isTitlePrimaryMatch(title, query) {
+  const soft = (s) =>
+    String(s || "")
+      .trim()
+      .toLowerCase()
+      .replace(/^q[:：\s]+/i, "")
+      .replace(/[？?！!。．.\s]+$/g, "")
+      .replace(/\s+/g, "");
+  const t = soft(title);
+  const q = soft(query);
+  if (!t || !q || q.length < 2) return false;
+  return t === q || t.includes(q) || (q.length >= 4 && q.includes(t));
+}
+
 function setStatus(title, text, mode = "loading") {
   $("statusTitle").textContent = title;
   $("statusText").textContent = text;
@@ -493,13 +508,15 @@ function renderResults(query, payload) {
       const isBest = index === 0;
       const badgeClass = isBest || matchPercent >= 70 ? "badge match-high" : "badge match-mid";
       const category = (item.catalog_path || []).slice(-1)[0] || item.doc_title || "";
+      const titlePrimary = isTitlePrimaryMatch(item.title, query);
+      const bodyHighlightQuery = titlePrimary ? "" : query;
       const answerHtml = answerText
         ? `<div class="answer-hit${isBest ? " is-best" : ""}">
             <span>解答</span>
-            <p>${highlight(answerText, query)}</p>
+            <p>${highlight(answerText, bodyHighlightQuery)}</p>
           </div>`
         : `<div class="snippet-label">原文摘录</div>
-           <div class="snippet">${highlight(previewText, query)}</div>`;
+           <div class="snippet">${highlight(previewText, bodyHighlightQuery)}</div>`;
       return `
         <article class="result-card${isBest ? " best" : ""}" style="animation-delay:${index * 40}ms">
           <div class="top">
@@ -509,7 +526,11 @@ function renderResults(query, payload) {
             </div>
             <span class="${badgeClass}">${escapeHtml(matchLabel)}</span>
           </div>
-          <div class="doc-title">所属文档：${escapeHtml(item.doc_title || "")}</div>
+          ${
+            item.doc_title && item.doc_title !== item.title
+              ? `<div class="doc-title">所属文档：${escapeHtml(item.doc_title || "")}</div>`
+              : ""
+          }
           ${path ? `<div class="path">${escapeHtml(path)}</div>` : ""}
           ${answerHtml}
           ${imageHtml}

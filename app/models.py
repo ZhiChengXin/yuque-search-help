@@ -45,13 +45,43 @@ def is_greeting_or_answer_label(title: str) -> bool:
     return False
 
 
+def is_outline_step_title(title: str) -> bool:
+    """是否像「1、」「3、检查…」「一、」这类正文步骤，不宜当作问题标题展示。"""
+    t = clean_heading_title(title)
+    if not t:
+        return False
+    # OUTLINE_LINE_RE 在文件后方定义；此处用轻量规则避免前向引用问题
+    if re.match(
+        r"^(?:"
+        r"[一二三四五六七八九十百]+[、．.]"
+        r"|问题\d+[：:]"
+        r"|第\s*[一二三四五六七八九十\d]+\s*(?:步|章|节)"
+        r"|\d+[、．.]"
+        r"|\d+\s+\S"
+        r")",
+        t,
+    ):
+        return True
+    return False
+
+
 def display_section_title(section_title: str, doc_title: str) -> str:
-    """搜索结果展示标题：问候语/答案起句回退到文档题。"""
+    """搜索结果展示标题：问候语/步骤条回退到文档题（问题本身）。"""
     st = clean_heading_title(section_title)
     dt = clean_heading_title(doc_title) or (doc_title or "").strip()
-    if not st or is_greeting_or_answer_label(st):
+    if not st or is_greeting_or_answer_label(st) or is_outline_step_title(st):
         return dt or st
     return st
+
+
+def prefer_doc_title_for_display(section_title: str, doc_title: str) -> bool:
+    """展示是否已回退到文档题（此时正文应作为解答展示）。"""
+    st = clean_heading_title(section_title)
+    dt = clean_heading_title(doc_title) or (doc_title or "").strip()
+    if not dt:
+        return False
+    shown = display_section_title(section_title, doc_title)
+    return shown == dt and st != dt
 
 
 @dataclass

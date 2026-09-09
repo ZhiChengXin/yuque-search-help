@@ -653,7 +653,14 @@ class SearchEngine:
                         continue
 
                 snippet_source = sec.content or eff_title
-                if answer and sec.kind == "qa":
+                from .models import prefer_doc_title_for_display
+
+                # 步骤条/问候语回退成文档题时：正文作为「解答」展示
+                if prefer_doc_title_for_display(sec.section_title, sec.doc_title):
+                    body = re.sub(r"\s+", " ", (sec.content or "").strip())
+                    if body and not answer:
+                        answer = body[:500]
+                if answer and (sec.kind == "qa" or prefer_doc_title_for_display(sec.section_title, sec.doc_title)):
                     preview = {"text": f"A：{answer}", "truncated": False}
                 else:
                     preview = make_preview(snippet_source, query, max_chars=500)
@@ -951,7 +958,13 @@ class SearchEngine:
     ) -> dict[str, Any]:
         answer = (sec.answer or "").strip() or extract_answer_from_content(sec.content)
         show_title = effective_section_title(sec)
-        if answer and sec.kind == "qa":
+        from .models import prefer_doc_title_for_display
+
+        if prefer_doc_title_for_display(sec.section_title, sec.doc_title):
+            body = re.sub(r"\s+", " ", (sec.content or "").strip())
+            if body and not answer:
+                answer = body[:500]
+        if answer and (sec.kind == "qa" or prefer_doc_title_for_display(sec.section_title, sec.doc_title)):
             preview = {"text": f"A：{answer}", "truncated": False}
         else:
             preview = make_preview(sec.content or show_title, query, max_chars=500)
@@ -1158,12 +1171,23 @@ class SearchEngine:
             if sec.id != target:
                 continue
             answer = (sec.answer or "").strip() or extract_answer_from_content(sec.content)
-            preview_text = f"A：{answer}" if answer and sec.kind == "qa" else (sec.content or "")[:500]
+            show_title = effective_section_title(sec)
+            from .models import prefer_doc_title_for_display
+
+            if prefer_doc_title_for_display(sec.section_title, sec.doc_title):
+                body = re.sub(r"\s+", " ", (sec.content or "").strip())
+                if body and not answer:
+                    answer = body[:500]
+            preview_text = (
+                f"A：{answer}"
+                if answer and (sec.kind == "qa" or prefer_doc_title_for_display(sec.section_title, sec.doc_title))
+                else (sec.content or "")[:500]
+            )
             return {
                 "id": sec.id,
-                "title": sec.section_title,
+                "title": show_title,
                 "doc_title": sec.doc_title,
-                "url": make_deep_url(sec.doc_url, sec.section_title, sec.section_anchor),
+                "url": make_deep_url(sec.doc_url, sec.section_title or show_title, sec.section_anchor),
                 "doc_url": sec.doc_url,
                 "snippet": preview_text,
                 "preview": preview_text,
@@ -1298,6 +1322,15 @@ class SearchEngine:
             return False
         bad = ("目录", "概述", "简介", "前言", "附录", "更新日志", "分工表", "各业务线")
         if any(b in title for b in bad):
+            return False
+        from .models import is_greeting_or_answer_label, is_outline_step_title
+
+        # 步骤条 / 客服口吻 / 「参考话术 2」这类小节名，不适合做随机推荐卡片
+        if is_greeting_or_answer_label(title) or is_outline_step_title(title):
+            return False
+        if re.match(r"^参考话术\s*\d+$", title.strip()):
+            return False
+        if re.fullmatch(r"[\d一二三四五六七八九十]+[、．.：:].{0,6}", title.strip()):
             return False
         return True
 
