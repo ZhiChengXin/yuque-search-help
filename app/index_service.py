@@ -60,6 +60,8 @@ class KnowledgeIndex:
         self.section_count = 0
         self.contact_count = 0
         self.last_split_audit: dict[str, Any] = {}
+        self._toc_cache: list[Any] | None = None
+        self._toc_cache_at: float = 0.0
 
     def _build_client(self) -> YuqueClient:
         return YuqueClient(
@@ -70,6 +72,18 @@ class KnowledgeIndex:
             username=self.settings.yuque_username,
             password=self.settings.yuque_password,
         )
+
+    def _catalog_path_cached(self, client: YuqueClient, slug: str) -> list[str]:
+        slug = (slug or "").strip()
+        if not slug:
+            return []
+        now = time.time()
+        if self._toc_cache is None or (now - self._toc_cache_at) > 300:
+            meta = client.fetch_book_meta()
+            toc = meta.get("toc") or []
+            self._toc_cache = toc if isinstance(toc, list) else []
+            self._toc_cache_at = now
+        return client.catalog_path_from_toc(slug, self._toc_cache or [])
 
     def sync(self) -> dict[str, Any]:
         with self._lock:
@@ -83,6 +97,8 @@ class KnowledgeIndex:
             logger.info("开始同步语雀知识库…")
             client.login()
             sections, contacts, doc_audits = client.fetch_all()
+            self._toc_cache = None
+            self._toc_cache_at = 0.0
             docs = {s.doc_id for s in sections}
             audit_summary = summarize_audits(doc_audits)
             self.last_split_audit = audit_summary
@@ -134,8 +150,122 @@ class KnowledgeIndex:
             with self._lock:
                 self.syncing = False
 
+    def _refresh_counts_unlocked(self) -> None:
+        docs = {s.doc_id for s in self.engine.sections}
+        self.doc_count = len(docs)
+        self.section_count = len(self.engine.sections)
+        self.contact_count = len(self.engine.contacts)
+        self.last_synced_at = time.time()
+        if self.vector_index is not None:
+            self.vector_count = self.vector_index.size
+
+    def remove_document(self, *, doc_id: str = "", slug: str = "") -> dict[str, Any]:
+        """增量删除：只清本地索引，不拉语雀。"""
+        doc_id = str(doc_id or "").strip()
+        slug = (slug or "").strip()
+        if not doc_id and not slug:
+            return {"ok": False, "message": "缺少 doc_id/slug"}
+        with self._lock:
+            removed = self.engine.remove_document(doc_id=doc_id, slug=slug)
+            if self.vector_index is not None:
+                self.vector_index.remove_document(doc_id=doc_id, slug=slug)
+            self._refresh_counts_unlocked()
+        logger.info("增量删除文档 doc_id=%s slug=%s removed_sections=%s", doc_id, slug, removed)
+        return {
+            "ok": True,
+            "mode": "delete",
+            "doc_id": doc_id,
+            "slug": slug,
+            "removed_sections": removed,
+            "doc_count": self.doc_count,
+            "section_count": self.section_count,
+            "vector_count": self.vector_count,
+        }
+
+    def sync_document(self, *, slug: str = "", doc_id: str = "") -> dict[str, Any]:
+        """增量同步单篇：只拉这一篇并替换索引。"""
+        slug = (slug or "").strip()
+        doc_id = str(doc_id or "").strip()
+        if not slug and not doc_id:
+            return {"ok": False, "message": "缺少 slug/doc_id"}
+
+        with self._lock:
+            if self.syncing:
+                return {"ok": False, "message": "同步进行中"}
+            self.syncing = True
+            self.last_error = None
+
+        client = self._build_client()
+        try:
+            client.login()
+            logger.info("增量同步文档 slug=%s doc_id=%s", slug, doc_id)
+            catalog_path: list[str] = []
+            try:
+                catalog_path = self._catalog_path_cached(client, slug)
+            except Exception:
+                logger.exception("增量同步读取目录失败 slug=%s", slug)
+            sections, contacts, audit = client.load_document(
+                {"id": doc_id, "slug": slug, "_catalog_path": catalog_path},
+                slug=slug,
+                doc_id=doc_id,
+            )
+            did = str((sections[0].doc_id if sections else doc_id) or doc_id).strip()
+            dslug = str((sections[0].slug if sections else slug) or slug).strip()
+            with self._lock:
+                self.engine.upsert_document(sections, contacts, doc_id=did, slug=dslug)
+                self._refresh_counts_unlocked()
+            vector_stats = {"total": self.vector_count, "embedded": 0, "reused": 0}
+            if self.vector_index is not None and sections:
+                try:
+                    vector_stats = self.vector_index.upsert_sections(sections)
+                    self.vector_count = int(vector_stats.get("total") or 0)
+                except Exception:
+                    logger.exception("增量向量更新失败")
+            if audit and audit.warnings:
+                logger.warning(
+                    "增量切分待关注 [%s] %s warnings=%s",
+                    did,
+                    (sections[0].doc_title if sections else ""),
+                    "; ".join(audit.warnings),
+                )
+            logger.info(
+                "增量同步完成 slug=%s sections=%s contacts=%s",
+                dslug,
+                len([s for s in sections if s.kind != "contact_row"]),
+                len(contacts),
+            )
+            return {
+                "ok": True,
+                "mode": "upsert",
+                "doc_id": did,
+                "slug": dslug,
+                "section_count": self.section_count,
+                "doc_count": self.doc_count,
+                "contact_count": self.contact_count,
+                "vector_count": self.vector_count,
+                "vector_embedded": vector_stats.get("embedded", 0),
+            }
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+            logger.exception("增量同步失败 slug=%s doc_id=%s", slug, doc_id)
+            # 文档已删或 404：当作删除处理
+            msg = str(exc).lower()
+            if "404" in msg or "不存在" in str(exc):
+                return self.remove_document(doc_id=doc_id, slug=slug)
+            return {"ok": False, "message": str(exc)}
+        finally:
+            client.close()
+            with self._lock:
+                self.syncing = False
+
     async def async_sync(self) -> dict[str, Any]:
         return await asyncio.to_thread(self.sync)
+
+    async def async_sync_document(self, *, slug: str = "", doc_id: str = "") -> dict[str, Any]:
+        return await asyncio.to_thread(self.sync_document, slug=slug, doc_id=doc_id)
+
+    async def async_remove_document(self, *, doc_id: str = "", slug: str = "") -> dict[str, Any]:
+        return await asyncio.to_thread(self.remove_document, doc_id=doc_id, slug=slug)
 
     def search(self, query: str, limit: int = 10, mode: str = "all", *, fast: bool = False) -> dict[str, Any]:
         mode_l = (mode or "all").strip().lower()

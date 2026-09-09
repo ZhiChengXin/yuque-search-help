@@ -457,6 +457,9 @@ class SearchEngine:
         # 联系人行单独展示，不混进正文检索主结果（避免噪声）
         self.sections = [s for s in sections if s.kind != "contact_row"]
         self.contacts = contacts
+        self._reindex_corpus()
+
+    def _reindex_corpus(self) -> None:
         self._by_id = {s.id: s for s in self.sections}
         self._corpus_tokens = []
         for sec in self.sections:
@@ -467,6 +470,57 @@ class SearchEngine:
             )
             self._corpus_tokens.append(tokenize(weighted))
         self._bm25 = BM25Okapi(self._corpus_tokens) if self._corpus_tokens else None
+
+    @staticmethod
+    def _section_matches_doc(sec: DocSection, *, doc_id: str = "", slug: str = "") -> bool:
+        if doc_id and str(sec.doc_id) == str(doc_id):
+            return True
+        if slug and (sec.slug == slug or (sec.doc_url or "").rstrip("/").endswith("/" + slug)):
+            return True
+        return False
+
+    def remove_document(self, *, doc_id: str = "", slug: str = "") -> int:
+        """按文档删除章节；联系人按 source_url/slug 清理。返回删除章节数。"""
+        before = len(self.sections)
+        self.sections = [
+            s
+            for s in self.sections
+            if not self._section_matches_doc(s, doc_id=doc_id, slug=slug)
+        ]
+        if slug or doc_id:
+            needle = f"/{slug}" if slug else ""
+            self.contacts = [
+                c
+                for c in self.contacts
+                if not (
+                    (slug and needle and needle in (c.source_url or ""))
+                    or (doc_id and doc_id in (c.source_url or ""))
+                )
+            ]
+        self._reindex_corpus()
+        return before - len(self.sections)
+
+    def upsert_document(
+        self,
+        sections: list[DocSection],
+        contacts: list[ContactRecord] | None = None,
+        *,
+        doc_id: str = "",
+        slug: str = "",
+    ) -> None:
+        """替换某文档的章节（及可选联系人），并重建 BM25。"""
+        doc_id = str(doc_id or (sections[0].doc_id if sections else "") or "").strip()
+        slug = (slug or (sections[0].slug if sections else "") or "").strip()
+        self.remove_document(doc_id=doc_id, slug=slug)
+        kept = [s for s in sections if s.kind != "contact_row"]
+        self.sections.extend(kept)
+        if contacts:
+            # 先清掉同文档联系人，再追加
+            if slug:
+                needle = f"/{slug}"
+                self.contacts = [c for c in self.contacts if needle not in (c.source_url or "")]
+            self.contacts.extend(contacts)
+        self._reindex_corpus()
 
     def search(
         self,

@@ -26,6 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 _webhook_sync_task: asyncio.Task | None = None
+_pending_webhook_events: dict[str, dict[str, str]] = {}
 
 
 def seconds_until_daily_at(hhmm: str) -> float:
@@ -55,29 +56,122 @@ class FeedbackRequest(BaseModel):
     mode: str = Field("", max_length=20)
 
 
-async def _debounced_sync(index: KnowledgeIndex, delay: float, reason: str) -> None:
+def parse_yuque_webhook(payload: Any) -> dict[str, str]:
+    """解析语雀推送：动作 + 文档 id/slug/title。"""
+    if not isinstance(payload, dict):
+        return {"action": "", "doc_id": "", "slug": "", "title": "", "key": "full"}
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        data = {}
+
+    action = str(
+        payload.get("webhook_subject_type")
+        or data.get("webhook_subject_type")
+        or data.get("action_type")
+        or payload.get("action")
+        or payload.get("event")
+        or ""
+    ).strip().lower()
+    if "delete" in action:
+        action = "delete"
+    elif "update" in action:
+        action = "update"
+    elif "publish" in action:
+        action = "publish"
+    else:
+        action = action.replace("doc_", "").replace("_doc", "")
+
+    doc_id = str(data.get("id") or payload.get("id") or "").strip()
+    slug = str(data.get("slug") or payload.get("slug") or "").strip()
+    title = str(data.get("title") or data.get("path") or "")[:120]
+    if not slug:
+        path = str(data.get("path") or "")
+        if "/" in path:
+            slug = path.rstrip("/").split("/")[-1]
+
+    key = doc_id or slug or "full"
+    return {
+        "action": action,
+        "doc_id": doc_id,
+        "slug": slug,
+        "title": title,
+        "key": key,
+    }
+
+
+async def _debounced_webhook_sync(index: KnowledgeIndex, delay: float) -> None:
     try:
         await asyncio.sleep(max(0.5, delay))
-        logger.info("webhook 触发同步 reason=%s", reason)
-        result = await index.async_sync()
-        if not result.get("ok"):
-            logger.error("webhook 同步失败: %s", result.get("message"))
-        else:
-            logger.info(
-                "webhook 同步完成 sections=%s",
-                (result.get("section_count") or result.get("status", {}).get("section_count")),
-            )
+        events = list(_pending_webhook_events.values())
+        _pending_webhook_events.clear()
+        if not events:
+            return
+
+        by_key: dict[str, dict[str, str]] = {}
+        for ev in events:
+            by_key[ev.get("key") or "full"] = ev
+
+        only_full = (
+            len(by_key) == 1
+            and "full" in by_key
+            and not (by_key["full"].get("doc_id") or by_key["full"].get("slug"))
+        )
+        if only_full:
+            logger.info("webhook 触发全量同步 reason=%s", by_key["full"].get("title") or "yuque")
+            result = await index.async_sync()
+            if not result.get("ok"):
+                logger.error("webhook 全量同步失败: %s", result.get("message"))
+            else:
+                logger.info("webhook 全量同步完成 sections=%s", result.get("section_count"))
+            return
+
+        for ev in by_key.values():
+            action = (ev.get("action") or "").lower()
+            doc_id = ev.get("doc_id") or ""
+            slug = ev.get("slug") or ""
+            title = ev.get("title") or ""
+            reason = f"{action}:{title or slug or doc_id}"
+            try:
+                if action == "delete":
+                    logger.info("webhook 增量删除 %s", reason)
+                    result = await index.async_remove_document(doc_id=doc_id, slug=slug)
+                elif doc_id or slug:
+                    logger.info("webhook 增量同步 %s", reason)
+                    result = await index.async_sync_document(slug=slug, doc_id=doc_id)
+                else:
+                    logger.info("webhook 缺文档标识，降级全量同步 %s", reason)
+                    result = await index.async_sync()
+                if not result.get("ok"):
+                    logger.error("webhook 处理失败 %s: %s", reason, result.get("message"))
+                else:
+                    logger.info(
+                        "webhook 处理完成 %s mode=%s sections=%s",
+                        reason,
+                        result.get("mode") or "full",
+                        result.get("section_count"),
+                    )
+            except Exception:
+                logger.exception("webhook 处理异常 %s", reason)
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.exception("webhook 同步异常")
 
 
-def schedule_webhook_sync(index: KnowledgeIndex, delay: float, reason: str) -> None:
+def schedule_webhook_sync(
+    index: KnowledgeIndex,
+    delay: float,
+    reason: str,
+    *,
+    event: dict[str, str] | None = None,
+) -> None:
     global _webhook_sync_task
+    ev = event or {"action": "", "doc_id": "", "slug": "", "title": reason, "key": "full"}
+    _pending_webhook_events[ev.get("key") or "full"] = ev
     if _webhook_sync_task and not _webhook_sync_task.done():
         _webhook_sync_task.cancel()
-    _webhook_sync_task = asyncio.create_task(_debounced_sync(index, delay, reason))
+    _webhook_sync_task = asyncio.create_task(_debounced_webhook_sync(index, delay))
 
 
 @asynccontextmanager
@@ -240,25 +334,26 @@ async def yuque_webhook(
     except Exception:
         payload = {}
 
-    action = ""
-    title = ""
-    if isinstance(payload, dict):
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        action = str(
-            payload.get("webhook_subject_type")
-            or payload.get("action")
-            or payload.get("event")
-            or ""
-        )
-        if isinstance(data, dict):
-            title = str(data.get("title") or data.get("path") or "")[:120]
+    event = parse_yuque_webhook(payload)
+    action = event.get("action") or ""
+    title = event.get("title") or ""
     reason = f"{action}:{title}" if title or action else "yuque-webhook"
     schedule_webhook_sync(
         app.state.index,
         float(settings.yuque_webhook_debounce_seconds or 12),
         reason,
+        event=event,
     )
-    return {"ok": True, "accepted": True, "reason": reason}
+    return {
+        "ok": True,
+        "accepted": True,
+        "reason": reason,
+        "mode": "delete"
+        if action == "delete"
+        else ("upsert" if (event.get("doc_id") or event.get("slug")) else "full"),
+        "doc_id": event.get("doc_id") or "",
+        "slug": event.get("slug") or "",
+    }
 
 
 @app.post("/api/feedback")

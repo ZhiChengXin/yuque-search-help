@@ -335,6 +335,103 @@ class LocalVectorIndex:
         )
         return {"total": len(keep_ids), "embedded": embedded, "reused": reused}
 
+    def remove_document(self, *, doc_id: str = "", slug: str = "") -> int:
+        """删除某文档相关向量（section id 以 doc_id: 开头，或含 slug）。"""
+        if not self.enabled:
+            return 0
+        doc_id = str(doc_id or "").strip()
+        slug = (slug or "").strip()
+        if not doc_id and not slug:
+            return 0
+        prefixes = []
+        if doc_id:
+            prefixes.append(f"{doc_id}:")
+        removed = 0
+        with self._lock:
+            keep_ids, keep_hashes, keep_vectors = [], [], []
+            for sid, h, vec in zip(self.ids, self.hashes, self.vectors):
+                drop = False
+                if any(sid.startswith(p) for p in prefixes):
+                    drop = True
+                elif slug and (f":{slug}" in sid or sid.startswith(slug)):
+                    drop = True
+                if drop:
+                    removed += 1
+                    continue
+                keep_ids.append(sid)
+                keep_hashes.append(h)
+                keep_vectors.append(vec)
+            self.ids = keep_ids
+            self.hashes = keep_hashes
+            self.vectors = keep_vectors
+            self._save()
+        return removed
+
+    def upsert_sections(self, sections: list[Any], *, batch_size: int = 32) -> dict[str, int]:
+        """增量写入若干章节向量：先按文档清旧再合并。"""
+        if not self.enabled:
+            return {"total": self.size, "embedded": 0, "reused": 0}
+        doc_ids = {str(getattr(s, "doc_id", "") or "") for s in sections}
+        slugs = {str(getattr(s, "slug", "") or "") for s in sections}
+        for did in doc_ids:
+            if did:
+                self.remove_document(doc_id=did)
+        for slug in slugs:
+            if slug:
+                self.remove_document(slug=slug)
+
+        # 在现有全量基础上追加新章节：复用 rebuild 的 hash 逻辑
+        # 构造临时「全量 = 旧保留 + 新 sections」——remove 已清旧，直接对「当前 ids + 新 sections」rebuild 过重
+        # 更简单：把新 sections 与现存 ids 对应的假 sections 无法拿到；改为只 embed 新 sections 再 append
+        items: list[tuple[str, str, str]] = []
+        for sec in sections:
+            kind = getattr(sec, "kind", "") or ""
+            if kind == "contact_row":
+                continue
+            sid = getattr(sec, "id", "") or ""
+            if not sid:
+                continue
+            for cid, text in build_section_embed_items(
+                section_id=sid,
+                title=getattr(sec, "section_title", "") or "",
+                content=getattr(sec, "content", "") or "",
+                answer=getattr(sec, "answer", "") or "",
+                doc_title=getattr(sec, "doc_title", "") or "",
+                catalog_path=list(getattr(sec, "catalog_path", None) or []),
+            ):
+                items.append((cid, _content_hash(text), text))
+
+        if not items:
+            return {"total": self.size, "embedded": 0, "reused": 0}
+
+        embedded = 0
+        new_ids: list[str] = []
+        new_hashes: list[str] = []
+        new_vectors: list[list[float]] = []
+        texts = [t for _, _, t in items]
+        for start in range(0, len(texts), batch_size):
+            chunk = texts[start : start + batch_size]
+            try:
+                vectors = self.client.embed_batch(chunk, timeout=30.0)
+            except Exception:
+                logger.exception("增量向量化失败")
+                continue
+            for offset, vec in enumerate(vectors):
+                if not vec:
+                    continue
+                i = start + offset
+                new_ids.append(items[i][0])
+                new_hashes.append(items[i][1])
+                new_vectors.append(vec)
+                embedded += 1
+
+        with self._lock:
+            self.ids.extend(new_ids)
+            self.hashes.extend(new_hashes)
+            self.vectors.extend(new_vectors)
+            self._save()
+        return {"total": self.size, "embedded": embedded, "reused": 0}
+
     def search(self, query: str, top_k: int = 12, min_score: float = 0.28) -> list[tuple[str, float]]:
         q = (query or "").strip()
         if not self.enabled or not q or not self.vectors:

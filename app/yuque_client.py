@@ -69,6 +69,8 @@ class YuqueClient:
         self.password = password
         self.namespace = f"{space_login}/{repo}"
         self.book_id: str | None = None
+        self._toc_cache: list[Any] | None = None
+        self._toc_cache_at: float = 0.0
         headers = {"User-Agent": BROWSER_UA}
         if self.token:
             headers["X-Auth-Token"] = self.token
@@ -237,6 +239,98 @@ class YuqueClient:
             params={"book_id": self.book_id, "raw": "1"},
         )
 
+    def _get_toc_cached(self, *, ttl_seconds: float = 300.0) -> list[Any]:
+        now = time.time()
+        if self._toc_cache is not None and (now - self._toc_cache_at) < ttl_seconds:
+            return self._toc_cache
+        meta = self.fetch_book_meta()
+        toc = meta.get("toc") or []
+        self._toc_cache = toc if isinstance(toc, list) else []
+        self._toc_cache_at = now
+        return self._toc_cache
+
+    def catalog_path_from_toc(self, slug: str, toc: list[Any]) -> list[str]:
+        if not slug or not toc:
+            return []
+        toc_item = next(
+            (
+                item
+                for item in toc
+                if isinstance(item, dict)
+                and str(item.get("type") or "").upper() == "DOC"
+                and (item.get("url") or item.get("slug")) == slug
+            ),
+            None,
+        )
+        if not toc_item:
+            return []
+        return self._resolve_catalog_path(toc, toc_item)
+
+    def _catalog_path_for_slug(self, slug: str) -> list[str]:
+        if not slug:
+            return []
+        try:
+            toc = self._get_toc_cached()
+        except Exception:
+            logger.exception("获取目录失败 slug=%s", slug)
+            return []
+        return self.catalog_path_from_toc(slug, toc)
+
+    def load_document(
+        self,
+        doc: dict[str, Any] | None = None,
+        *,
+        slug: str = "",
+        doc_id: str = "",
+    ) -> tuple[list[DocSection], list[ContactRecord], DocumentAudit | None]:
+        """拉取并切分单篇文档（增量同步用）。"""
+        meta = dict(doc or {})
+        slug = (slug or meta.get("slug") or "").strip()
+        doc_id = str(doc_id or meta.get("id") or slug).strip()
+        key = slug or doc_id
+        if not key:
+            raise ValueError("缺少文档 slug/id")
+
+        detail = self.fetch_doc_detail(key)
+        if not isinstance(detail, dict) or not detail:
+            raise RuntimeError(f"文档不存在或无法读取: {key}")
+
+        slug = (detail.get("slug") or slug or "").strip()
+        doc_id = str(detail.get("id") or doc_id or slug).strip()
+        title = (detail.get("title") or meta.get("title") or "未命名文档").strip()
+        catalog_path = meta.get("_catalog_path")
+        if not isinstance(catalog_path, list):
+            catalog_path = self._catalog_path_for_slug(slug)
+        updated_at = str(detail.get("updated_at") or meta.get("updated_at") or "")
+        doc_url = f"{self.host}/{self.namespace}/{slug}" if slug else ""
+        fmt = (meta.get("format") or detail.get("format") or "").lower()
+
+        if fmt == "lakesheet":
+            body = detail.get("body") or detail.get("body_sheet") or detail.get("content") or ""
+            parsed = parse_lakesheet_contacts(body, source_url=doc_url)
+            contact_sections = contacts_to_sections(
+                parsed,
+                doc_id=doc_id,
+                slug=slug,
+                doc_title=title,
+                doc_url=doc_url,
+            )
+            return contact_sections, parsed, None
+
+        raw = self.fetch_anchor_markdown(slug) if slug else ""
+        if not raw:
+            raw = detail.get("body_html") or detail.get("body") or ""
+        split, audit = split_document(
+            raw,
+            doc_id=doc_id,
+            slug=slug,
+            doc_title=title,
+            doc_url=doc_url,
+            catalog_path=catalog_path,
+            updated_at=updated_at,
+        )
+        return split, [], audit
+
     def fetch_all(
         self, concurrency: int = 4
     ) -> tuple[list[DocSection], list[ContactRecord], list[DocumentAudit]]:
@@ -248,40 +342,7 @@ class YuqueClient:
         audits: list[DocumentAudit] = []
 
         def load_one(doc: dict[str, Any]) -> tuple[list[DocSection], list[ContactRecord], DocumentAudit | None]:
-            slug = doc.get("slug") or ""
-            doc_id = str(doc.get("id") or slug)
-            title = (doc.get("title") or "未命名文档").strip()
-            catalog_path = doc.get("_catalog_path") or []
-            updated_at = str(doc.get("updated_at") or "")
-            doc_url = f"{self.host}/{self.namespace}/{slug}"
-            detail = self.fetch_doc_detail(slug or doc_id)
-            fmt = (doc.get("format") or detail.get("format") or "").lower()
-
-            if fmt == "lakesheet":
-                body = detail.get("body") or detail.get("body_sheet") or detail.get("content") or ""
-                parsed = parse_lakesheet_contacts(body, source_url=doc_url)
-                contact_sections = contacts_to_sections(
-                    parsed,
-                    doc_id=doc_id,
-                    slug=slug,
-                    doc_title=title,
-                    doc_url=doc_url,
-                )
-                return contact_sections, parsed, None
-
-            raw = self.fetch_anchor_markdown(slug)
-            if not raw:
-                raw = detail.get("body_html") or detail.get("body") or ""
-            split, audit = split_document(
-                raw,
-                doc_id=doc_id,
-                slug=slug,
-                doc_title=title,
-                doc_url=doc_url,
-                catalog_path=catalog_path,
-                updated_at=updated_at,
-            )
-            return split, [], audit
+            return self.load_document(doc)
 
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = [pool.submit(load_one, d) for d in docs]
