@@ -147,6 +147,12 @@ QA_BLOCK_RE = re.compile(
     r"(?:^|\n)\s*Q[:：]\s*(.+?)\s*\n\s*A[:：]\s*(.+?)(?=(?:\n\s*Q[:：])|$)",
     re.IGNORECASE | re.DOTALL,
 )
+# 操作手册常见：粗体问题句换行后直接 A：，无 Q：前缀
+IMPLICIT_QA_RE = re.compile(
+    r"(?:^|\n)\s*(?!A[:：])([^\n]{4,100}?)\s*\n\s*A[:：]\s*(.+?)"
+    r"(?=(?:\n\s*(?!A[:：])[^\n]{4,100}?\s*\n\s*A[:：])|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 # 语雀 FAQ 常见编号：Q1：问题 … Q2：问题（无显式 A：，答案为后续条目）
 NUMBERED_QA_MARKER_RE = re.compile(r"(?:^|\n)\s*(Q\d+)\s*[:：]\s*", re.IGNORECASE)
 NUMBERED_QA_RAW_MARKER_RE = re.compile(
@@ -702,7 +708,23 @@ def split_qa_from_raw(
         )
         if parts:
             return parts
-        return split_numbered_qa_sections(
+        parts = split_numbered_qa_sections(
+            text,
+            doc_id=doc_id,
+            slug=slug,
+            doc_title=doc_title,
+            doc_url=doc_url,
+            catalog_path=catalog_path,
+            updated_at=updated_at,
+            images=shared_images,
+            id_prefix=id_prefix,
+            parent_title=parent_title,
+            parent_url=parent_url,
+            parent_anchor=parent_anchor,
+        )
+        if parts:
+            return parts
+        return split_implicit_qa_sections(
             text,
             doc_id=doc_id,
             slug=slug,
@@ -923,8 +945,18 @@ def split_anchor_markdown(
         chunk = raw[start:end]
         body = markdown_or_html_to_text(chunk)
         deep_url = f"{doc_url}#{anchor}" if anchor else doc_url
+        # Q/A 只吃「到下一个任意下级标题之前」的正文，避免 H1 把整篇问答
+        # 都挂到文档总标题锚点（如 #PrNzh），导致无法跳到「十、常见问题」(#Ki4yk)
+        qa_end = end
+        for j in range(i + 1, len(matches)):
+            if matches[j].start() >= end:
+                break
+            if int(matches[j].group(1)) > level:
+                qa_end = matches[j].start()
+                break
+        qa_chunk = raw[start:qa_end]
         qa_sections = split_qa_from_raw(
-            chunk,
+            qa_chunk,
             doc_id=doc_id,
             slug=slug,
             doc_title=doc_title,
@@ -1129,6 +1161,67 @@ def split_qa_sections(
         )
     return sections
 
+
+def split_implicit_qa_sections(
+    text: str,
+    *,
+    doc_id: str,
+    slug: str,
+    doc_title: str,
+    doc_url: str,
+    catalog_path: list[str],
+    updated_at: str = "",
+    images: list[str] | None = None,
+    id_prefix: str = "qa",
+    parent_title: str = "",
+    parent_url: str = "",
+    parent_anchor: str = "",
+) -> list[DocSection]:
+    """识别「问题句\\nA：答案」——无 Q：前缀的手册常见问题。"""
+    source = (text or "").strip()
+    if not source or ("A：" not in source and "A:" not in source):
+        return []
+    matches = list(IMPLICIT_QA_RE.finditer(source))
+    if len(matches) < 1:
+        return []
+    sections: list[DocSection] = []
+    shared_images = list(images or [])
+    for idx, match in enumerate(matches):
+        question = re.sub(r"\s+", " ", (match.group(1) or "").strip())
+        answer = re.sub(r"\s+", " ", (match.group(2) or "").strip())
+        question = clean_heading_title(question)
+        question = re.sub(r"^[Qq][:：]\s*", "", question).strip()
+        answer = re.sub(r"^[Aa][:：]\s*", "", answer).strip()
+        # 过滤文档版本行、过短/过长噪声
+        if len(question) < 4 or len(question) > 80 or not answer:
+            continue
+        if question.startswith(("文档版本", "最后更新", "备注", "说明")):
+            continue
+        if is_greeting_or_answer_label(question):
+            continue
+        section_id = f"{doc_id}:{id_prefix}-{idx + 1}"
+        deep = make_deep_url(parent_url or doc_url, question, parent_anchor)
+        item_images = shared_images if (idx == 0 or len(shared_images) <= 2) else []
+        sections.append(
+            DocSection(
+                id=section_id,
+                doc_id=doc_id,
+                slug=slug,
+                doc_title=doc_title,
+                section_title=question,
+                section_anchor=parent_anchor,
+                content=f"Q：{question}\nA：{answer}",
+                url=deep,
+                doc_url=doc_url,
+                catalog_path=catalog_path,
+                updated_at=updated_at,
+                kind="qa",
+                images=item_images,
+                level=0,
+                answer=answer,
+            )
+        )
+    return sections
 
 def _cell_text(cell: Any) -> str:
     """兼容语雀表格单元格新旧字段：value / v。"""
