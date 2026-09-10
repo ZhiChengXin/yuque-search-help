@@ -99,15 +99,11 @@ class KnowledgeIndex:
             sections, contacts, doc_audits = client.fetch_all()
             self._toc_cache = None
             self._toc_cache_at = 0.0
-            docs = {s.doc_id for s in sections}
             audit_summary = summarize_audits(doc_audits)
             self.last_split_audit = audit_summary
             with self._lock:
                 self.engine.rebuild(sections, contacts)
-                self.doc_count = len(docs)
-                self.section_count = len([s for s in sections if s.kind != "contact_row"])
-                self.contact_count = len(contacts)
-                self.last_synced_at = time.time()
+                self._refresh_counts_unlocked()
             # 本地向量索引：增量更新，原文仍只在语雀
             vector_stats = {"total": 0, "embedded": 0, "reused": 0}
             if self.vector_index is not None:
@@ -151,13 +147,87 @@ class KnowledgeIndex:
                 self.syncing = False
 
     def _refresh_counts_unlocked(self) -> None:
-        docs = {s.doc_id for s in self.engine.sections}
-        self.doc_count = len(docs)
+        # 只统计「有检索章节」的文档，与 engine 一致；避免全量/增量口径漂移
+        self.doc_count = len(
+            {str(s.doc_id).strip() for s in self.engine.sections if str(s.doc_id or "").strip()}
+        )
         self.section_count = len(self.engine.sections)
         self.contact_count = len(self.engine.contacts)
         self.last_synced_at = time.time()
         if self.vector_index is not None:
             self.vector_count = self.vector_index.size
+
+    def reconcile_removed_docs(self) -> dict[str, Any]:
+        """对照语雀当前库文档列表，清掉已挪走/删除但本地仍残留的索引。"""
+        with self._lock:
+            if self.syncing:
+                return {"ok": False, "message": "同步进行中"}
+            self.syncing = True
+            self.last_error = None
+
+        client = self._build_client()
+        try:
+            client.login()
+            remote = client.list_docs()
+            remote_ids = {str(d.get("id") or "").strip() for d in remote if d.get("id")}
+            remote_slugs = {(d.get("slug") or "").strip() for d in remote if d.get("slug")}
+            removed: list[dict[str, Any]] = []
+            with self._lock:
+                local_docs: dict[str, str] = {}
+                for sec in self.engine.sections:
+                    did = str(sec.doc_id or "").strip()
+                    if not did:
+                        continue
+                    if did not in local_docs or (sec.slug and not local_docs[did]):
+                        local_docs[did] = (sec.slug or "").strip()
+
+                for did, slug in local_docs.items():
+                    if did in remote_ids:
+                        continue
+                    if slug and slug in remote_slugs:
+                        continue
+                    n = self.engine.remove_document(doc_id=did, slug=slug)
+                    if self.vector_index is not None:
+                        self.vector_index.remove_document(doc_id=did, slug=slug)
+                    if n:
+                        removed.append({"doc_id": did, "slug": slug, "removed_sections": n})
+
+                # 联系人表若所属文档已不在本库，一并清掉
+                kept_contacts = []
+                for row in self.engine.contacts:
+                    url = (row.source_url or "").rstrip("/")
+                    slug = url.split("/")[-1] if url else ""
+                    if not slug or slug in remote_slugs:
+                        kept_contacts.append(row)
+                self.engine.contacts = kept_contacts
+
+                self._refresh_counts_unlocked()
+
+            if removed:
+                logger.info(
+                    "索引对账删除残留文档 %s 篇：%s",
+                    len(removed),
+                    ", ".join(f"{x.get('slug') or x.get('doc_id')}" for x in removed[:8]),
+                )
+            else:
+                logger.info("索引对账完成：无残留文档")
+            return {
+                "ok": True,
+                "mode": "reconcile",
+                "removed_count": len(removed),
+                "removed": removed[:50],
+                "doc_count": self.doc_count,
+                "section_count": self.section_count,
+                "vector_count": self.vector_count,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+            logger.exception("索引对账失败")
+            return {"ok": False, "message": str(exc)}
+        finally:
+            client.close()
+            with self._lock:
+                self.syncing = False
 
     def remove_document(self, *, doc_id: str = "", slug: str = "") -> dict[str, Any]:
         """增量删除：只清本地索引，不拉语雀。"""
@@ -266,6 +336,9 @@ class KnowledgeIndex:
 
     async def async_remove_document(self, *, doc_id: str = "", slug: str = "") -> dict[str, Any]:
         return await asyncio.to_thread(self.remove_document, doc_id=doc_id, slug=slug)
+
+    async def async_reconcile_removed_docs(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.reconcile_removed_docs)
 
     def search(self, query: str, limit: int = 10, mode: str = "all", *, fast: bool = False) -> dict[str, Any]:
         mode_l = (mode or "all").strip().lower()

@@ -146,13 +146,27 @@ async def _debounced_webhook_sync(index: KnowledgeIndex, delay: float) -> None:
                     logger.error("webhook 处理失败 %s: %s", reason, result.get("message"))
                 else:
                     logger.info(
-                        "webhook 处理完成 %s mode=%s sections=%s",
+                        "webhook 处理完成 %s mode=%s docs=%s sections=%s",
                         reason,
                         result.get("mode") or "full",
+                        result.get("doc_count"),
                         result.get("section_count"),
                     )
             except Exception:
                 logger.exception("webhook 处理异常 %s", reason)
+
+        # 挪库/静默删除：对账清残留（只拉文档列表，不重拉正文）
+        try:
+            recon = await index.async_reconcile_removed_docs()
+            if recon.get("ok") and recon.get("removed_count"):
+                logger.info(
+                    "webhook 对账清理残留 %s 篇，当前 docs=%s sections=%s",
+                    recon.get("removed_count"),
+                    recon.get("doc_count"),
+                    recon.get("section_count"),
+                )
+        except Exception:
+            logger.exception("webhook 对账异常")
     except asyncio.CancelledError:
         raise
     except Exception:
